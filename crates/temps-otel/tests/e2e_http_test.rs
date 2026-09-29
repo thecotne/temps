@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tower::ServiceExt;
 
-use temps_otel::handlers::configure_routes;
+use temps_otel::handlers::{configure_public_routes, configure_routes};
 use temps_otel::ingest::auth::OtelAuthService;
 use temps_otel::ingest::rate_limit::RateLimiter;
 use temps_otel::services::OtelService;
@@ -341,7 +341,8 @@ async fn setup_e2e_as_full(
 
     // Create auth middleware that injects AuthContext into request extensions.
     // Query handlers use RequireAuth which reads AuthContext from extensions.
-    // Ingest handlers use their own API key auth (not RequireAuth), so this doesn't affect them.
+    // Ingest handlers use their own API key auth (not RequireAuth), and are
+    // served on the public router, which never gets this layer.
     //
     // `role: None` injects nothing, which is how the unauthenticated case is
     // reproduced — RequireAuth then finds no AuthContext and returns 401.
@@ -358,8 +359,10 @@ async fn setup_e2e_as_full(
         },
     );
 
-    let router = configure_routes()
-        .layer(auth_middleware)
+    // One router carrying both route sets, as single-listener mode serves
+    // them: public OTLP ingest without the auth layer, admin queries with it.
+    let router = configure_public_routes()
+        .merge(configure_routes().layer(auth_middleware))
         .with_state(app_state);
 
     Some((test_db, router, project_id, metrics_store))

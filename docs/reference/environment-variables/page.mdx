@@ -75,7 +75,7 @@ existing route, change the subnet and all three addresses together:
 
 ### Admin Listener (optional)
 
-When the admin listener is configured, admin/management routes bind to a separate address while `TEMPS_CONSOLE_ADDRESS` only serves public ingest endpoints (analytics events, error tracking ingest, AI gateway, worker route sync, email tracking pixels). See the [admin listener guide](/docs/admin-listener) for the full route classification and deployment patterns.
+When the admin listener is configured, admin/management routes bind to a separate address while `TEMPS_CONSOLE_ADDRESS` only serves public ingest endpoints (analytics events, error tracking ingest, OpenTelemetry (OTLP) ingest, AI gateway, worker route sync, email tracking pixels). See the [admin listener guide](/docs/admin-listener) for the full route classification and deployment patterns.
 
 | Variable                           | CLI Flag                  | Default    | Description                                                                                |
 | ---------------------------------- | ------------------------- | ---------- | ------------------------------------------------------------------------------------------ |
