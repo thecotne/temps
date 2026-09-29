@@ -7,9 +7,10 @@ use maxminddb::Mmap;
 use rand::prelude::IndexedRandom;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
+use temps_core::url_validation::{validate_ipv4, validate_ipv6};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -79,12 +80,47 @@ fn is_hosting_org(org: &str) -> bool {
     HOSTING_ORG_PATTERNS.iter().any(|pat| lower.contains(pat))
 }
 
+/// Whether `ip` can appear in a public GeoIP database at all.
+///
+/// Private (RFC 1918), loopback, link-local, CGNAT (RFC 6598), unique-local
+/// (`fc00::/7`), documentation, multicast and the other special-use ranges are
+/// never allocated to a network, so MaxMind has no record for them and a lookup
+/// can only answer "not found". The classification is the SSRF policy in
+/// [`temps_core::url_validation`], which already encodes exactly that set, so
+/// the two cannot drift apart.
+///
+/// The one exemption is the IPv6 prefixes that embed an IPv4 address. The
+/// MaxMind DB format aliases its IPv4 tree at `2001::/32` (Teredo) and
+/// `2002::/16` (6to4), so those can resolve even though the SSRF policy
+/// rejects them as destinations; they keep going to the database as before.
+fn is_globally_routable(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => validate_ipv4(v4).is_ok(),
+        IpAddr::V6(v6) => is_ipv4_aliased_prefix(v6) || validate_ipv6(v6).is_ok(),
+    }
+}
+
+/// `2001::/32` (Teredo) and `2002::/16` (6to4): IPv6 prefixes under which the
+/// MaxMind DB format aliases its IPv4 data.
+fn is_ipv4_aliased_prefix(ip: &Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x2002 || (segments[0] == 0x2001 && segments[1] == 0)
+}
+
 #[derive(Error, Debug)]
 pub enum GeoIpError {
     #[error("Failed to open MaxMind database: {0}")]
     DatabaseError(#[from] maxminddb::MaxMindDbError),
     #[error("IP address not found in database")]
     NotFound(String),
+    /// The address is private, loopback, link-local, CGNAT, unique-local or
+    /// otherwise not globally routable, so no public GeoIP database can hold a
+    /// record for it. Expected for clients that reach Temps over a private
+    /// network (containers on a bridge network, a loopback proxy hop), so it is
+    /// a "no geolocation" answer rather than a lookup failure: callers should
+    /// not log it as an error.
+    #[error("IP address {0} is not globally routable, so it has no geolocation")]
+    NonGlobalAddress(IpAddr),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
     #[error("Other error: {0}")]
@@ -555,6 +591,14 @@ pub struct MaxMindGeoIpService {
 
 impl MaxMindGeoIpService {
     pub async fn geolocate(&self, ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
+        // A private or otherwise non-global address can never be in the
+        // database. Answer immediately instead of walking the tree to a
+        // guaranteed miss, and say why so callers can tell it apart from a
+        // real failure.
+        if !is_globally_routable(&ip) {
+            return Err(GeoIpError::NonGlobalAddress(ip));
+        }
+
         info!("Geolocating IP: {}", ip);
 
         // One snapshot per lookup: a concurrent refresh publishes a new reader
@@ -657,6 +701,18 @@ impl MaxMindGeoIpService {
             is_hosting_provider: None,
         }
     }
+}
+
+/// Path of the GeoLite2 city database shipped in this checkout, or `None` when
+/// it is absent, in which case the tests that need a real database skip rather
+/// than fail -- the same convention the Docker-dependent tests follow.
+#[cfg(test)]
+pub(crate) fn bundled_city_db_path() -> Option<PathBuf> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("temps-cli")
+        .join(crate::refresh::CITY_DB_FILENAME);
+    path.exists().then_some(path)
 }
 
 /// Mock GeoIP service for local development
@@ -913,5 +969,233 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).expect("remove test directories");
+    }
+
+    fn ip(addr: &str) -> IpAddr {
+        addr.parse().expect("test address must parse")
+    }
+
+    fn assert_all(addresses: &[&str], expected: bool, why: &str) {
+        for addr in addresses {
+            assert_eq!(
+                is_globally_routable(&ip(addr)),
+                expected,
+                "{addr} ({why}): expected globally routable = {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_ipv4_space_is_not_globally_routable() {
+        // 172.30.5.9 is the shape of an address on a container bridge network.
+        assert_all(
+            &[
+                "10.0.0.1",
+                "10.255.255.255",
+                "172.16.0.1",
+                "172.30.5.9",
+                "172.31.255.255",
+                "192.168.0.1",
+                "192.168.255.254",
+            ],
+            false,
+            "RFC 1918",
+        );
+    }
+
+    #[test]
+    fn loopback_and_link_local_ipv4_are_not_globally_routable() {
+        assert_all(&["127.0.0.1", "127.255.255.254"], false, "loopback");
+        assert_all(
+            &["169.254.0.1", "169.254.169.254"],
+            false,
+            "link-local / cloud metadata",
+        );
+    }
+
+    #[test]
+    fn cgnat_ipv4_is_not_globally_routable() {
+        assert_all(
+            &["100.64.0.1", "100.100.100.200", "100.127.255.255"],
+            false,
+            "RFC 6598 shared address space",
+        );
+    }
+
+    #[test]
+    fn other_special_use_ipv4_is_not_globally_routable() {
+        assert_all(
+            &[
+                "0.0.0.0",
+                "0.1.2.3",
+                "224.0.0.1",
+                "240.0.0.1",
+                "255.255.255.255",
+                "198.18.0.1",
+            ],
+            false,
+            "unspecified / multicast / reserved / broadcast / benchmarking",
+        );
+    }
+
+    /// Documentation ranges are reserved and never allocated, so they cannot be
+    /// in the database either.
+    #[test]
+    fn documentation_addresses_are_not_globally_routable() {
+        assert_all(
+            &["192.0.2.1", "198.51.100.7", "203.0.113.10", "2001:db8::1"],
+            false,
+            "RFC 5737 / RFC 3849 documentation",
+        );
+    }
+
+    /// The neighbours of each private block are ordinary public space and must
+    /// still be looked up.
+    #[test]
+    fn addresses_just_outside_the_private_blocks_are_globally_routable() {
+        assert_all(
+            &[
+                "9.255.255.255",
+                "11.0.0.1",
+                "100.63.255.255",
+                "100.128.0.1",
+                "126.255.255.255",
+                "128.0.0.1",
+                "169.253.255.255",
+                "169.255.0.1",
+                "172.15.255.255",
+                "172.32.0.1",
+                "192.167.255.255",
+                "192.169.0.1",
+            ],
+            true,
+            "public space bordering a private block",
+        );
+    }
+
+    #[test]
+    fn non_global_ipv6_is_not_globally_routable() {
+        assert_all(&["::1"], false, "loopback");
+        assert_all(&["::"], false, "unspecified");
+        assert_all(
+            &["fc00::1", "fd00::4", "fd12:3456:789a::1"],
+            false,
+            "unique local, fc00::/7",
+        );
+        assert_all(&["fe80::1", "febf::1"], false, "link-local, fe80::/10");
+        assert_all(&["fec0::1"], false, "deprecated site-local");
+        assert_all(&["ff02::1"], false, "multicast");
+    }
+
+    /// A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`; the
+    /// embedded address decides.
+    #[test]
+    fn ipv4_mapped_ipv6_is_classified_by_the_embedded_address() {
+        assert_all(
+            &[
+                "::ffff:172.30.5.9",
+                "::ffff:192.168.1.10",
+                "::ffff:127.0.0.1",
+            ],
+            false,
+            "mapped private / loopback",
+        );
+        assert_all(&["::ffff:100.128.0.1"], true, "mapped public");
+    }
+
+    #[test]
+    fn global_unicast_ipv6_is_globally_routable() {
+        assert_all(
+            &["2600::1", "2a00::1", "2800::1"],
+            true,
+            "global unicast, 2000::/3",
+        );
+    }
+
+    /// The MaxMind format aliases its IPv4 tree under these prefixes, so an
+    /// address in them can resolve and must keep reaching the database.
+    #[test]
+    fn ipv6_prefixes_that_alias_the_ipv4_tree_are_still_looked_up() {
+        assert_all(&["2002:c000:204::1"], true, "6to4, 2002::/16");
+        assert_all(&["2001:0:4136:e378::1"], true, "Teredo, 2001::/32");
+        // Not aliased: the rest of the IETF protocol block stays rejected.
+        assert_all(&["2001:1::1", "2001:db8::1"], false, "other 2001::/23");
+    }
+
+    fn bundled_service() -> Option<GeoIpService> {
+        let Some(path) = bundled_city_db_path() else {
+            println!(
+                "{} is not in this checkout; skipping",
+                crate::CITY_DB_FILENAME
+            );
+            return None;
+        };
+        Some(GeoIpService::from_city_db_path(&path).expect("open the bundled database"))
+    }
+
+    /// The reported symptom: an event posted from a container on a private
+    /// network resolved to `NotFound`, which the caller then logged as an
+    /// error. Non-global addresses now answer with their own variant instead.
+    #[tokio::test]
+    async fn a_non_global_address_is_answered_without_a_database_lookup() {
+        let Some(service) = bundled_service() else {
+            return;
+        };
+
+        for addr in [
+            "172.30.5.9",
+            "10.0.0.7",
+            "127.0.0.1",
+            "100.64.1.2",
+            "169.254.10.10",
+            "::1",
+            "fd00::4",
+            "fe80::1",
+        ] {
+            let outcome = service.geolocate(ip(addr)).await;
+            assert!(
+                matches!(&outcome, Err(GeoIpError::NonGlobalAddress(got)) if *got == ip(addr)),
+                "{addr}: expected NonGlobalAddress, got {outcome:?}"
+            );
+        }
+    }
+
+    /// The short-circuit must not swallow addresses that can be in the
+    /// database: they still reach the lookup and get its real answer.
+    #[tokio::test]
+    async fn a_global_address_still_reaches_the_database() {
+        let Some(service) = bundled_service() else {
+            return;
+        };
+
+        for addr in ["100.128.0.1", "172.32.0.1", "2600::1", "::ffff:100.128.0.1"] {
+            let outcome = service.geolocate(ip(addr)).await;
+            assert!(
+                !matches!(outcome, Err(GeoIpError::NonGlobalAddress(_))),
+                "{addr} is globally routable and must be looked up, got {outcome:?}"
+            );
+        }
+    }
+
+    /// Local development runs on the mock, which deliberately gives private
+    /// addresses a random city so the UI has data to show. The short-circuit
+    /// belongs to the real database path only.
+    #[tokio::test]
+    async fn the_mock_still_resolves_private_addresses_for_local_development() {
+        let mock = MockGeoIpService::new();
+
+        for addr in ["127.0.0.1", "172.30.5.9", "192.168.1.10", "::1"] {
+            let located = mock
+                .geolocate(ip(addr))
+                .await
+                .unwrap_or_else(|e| panic!("the mock must resolve {addr}: {e}"));
+            assert!(located.country.is_some(), "{addr} must get a mock city");
+        }
+    }
+
+    #[test]
+    fn the_non_global_error_names_the_address() {
+        let message = GeoIpError::NonGlobalAddress(ip("172.30.5.9")).to_string();
+        assert!(message.contains("172.30.5.9"), "got: {message}");
     }
 }
