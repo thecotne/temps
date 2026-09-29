@@ -243,21 +243,14 @@ export function TempsAnalyticsProvider({
         {children}
         {enabled && (
           <SessionRecorder
+            // The whole config is forwarded, so the provider path accepts every
+            // option a standalone <SessionRecorder> does. Transport props come
+            // last so a stray key in the config cannot redirect ingest.
+            {...sessionRecordingConfig}
             basePath={basePath}
             ingestKey={ingestKey}
             domain={domain}
             enabled={isRecordingEnabled}
-            excludedPaths={sessionRecordingConfig.excludedPaths}
-            sessionSampleRate={sessionRecordingConfig.sessionSampleRate}
-            maskAllInputs={sessionRecordingConfig.maskAllInputs}
-            maskTextSelector={sessionRecordingConfig.maskTextSelector}
-            blockClass={sessionRecordingConfig.blockClass}
-            ignoreClass={sessionRecordingConfig.ignoreClass}
-            maskTextClass={sessionRecordingConfig.maskTextClass}
-            recordCanvas={sessionRecordingConfig.recordCanvas}
-            collectFonts={sessionRecordingConfig.collectFonts}
-            batchSize={sessionRecordingConfig.batchSize}
-            flushInterval={sessionRecordingConfig.flushInterval}
           />
         )}
       </SessionRecordingProvider>

@@ -5,8 +5,8 @@ import type React from "react";
 import type {
   JsonValue,
   AnalyticsClientOptions,
-  SessionRecordingConfig,
 } from "@temps-sdk/analytics-core";
+import type { SessionRecorderConfig } from "./SessionRecorder";
 
 export type {
   JsonPrimitive,
@@ -16,6 +16,7 @@ export type {
   WebVitalMetric,
   SpeedMetric,
 } from "@temps-sdk/analytics-core";
+export type { SessionRecorderConfig, SessionRecorderProps } from "./SessionRecorder";
 
 export interface AnalyticsContextValue {
   /** Send a custom event. */
@@ -47,8 +48,11 @@ export interface TempsAnalyticsProviderProps extends AnalyticsClientOptions {
   engagementThreshold?: number;
   /** Enable session recording. Defaults to false. */
   enableSessionRecording?: boolean;
-  /** Session recording configuration. */
-  sessionRecordingConfig?: SessionRecordingConfig;
+  /**
+   * Session recording configuration. Every field is forwarded to the recorder,
+   * with the same defaults as a standalone `SessionRecorder`.
+   */
+  sessionRecordingConfig?: SessionRecorderConfig;
   /** Children to render inside the provider. */
   children: React.ReactNode;
 }
