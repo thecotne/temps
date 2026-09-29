@@ -67,7 +67,12 @@ impl AuthRateLimiter {
     /// Check if a request for the given identity key should be allowed.
     /// Returns Ok(()) if allowed, Err(()) if rate limited.
     pub(crate) async fn check(&self, key: &str) -> Result<(), ()> {
-        let now = Instant::now();
+        self.check_at(key, Instant::now()).await
+    }
+
+    /// [`check`](Self::check) against an explicit clock reading, so tests can
+    /// replay a request schedule spanning minutes without sleeping.
+    pub(crate) async fn check_at(&self, key: &str, now: Instant) -> Result<(), ()> {
         let window_start = now - self.config.window;
 
         let mut entries = self.entries.lock().await;
@@ -211,6 +216,36 @@ mod tests {
 
         // Should be allowed again
         assert!(limiter.check("1.2.3.4").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_check_at_uses_the_supplied_clock() {
+        let limiter = AuthRateLimiter::new(AuthRateLimitConfig {
+            max_requests: 2,
+            window: Duration::from_secs(60),
+            ..Default::default()
+        });
+        let t0 = Instant::now();
+
+        assert!(limiter.check_at("1.2.3.4", t0).await.is_ok());
+        assert!(limiter
+            .check_at("1.2.3.4", t0 + Duration::from_secs(1))
+            .await
+            .is_ok());
+        assert!(limiter
+            .check_at("1.2.3.4", t0 + Duration::from_secs(2))
+            .await
+            .is_err());
+
+        // Still full until the first request slides out of the window.
+        assert!(limiter
+            .check_at("1.2.3.4", t0 + Duration::from_secs(59))
+            .await
+            .is_err());
+        assert!(limiter
+            .check_at("1.2.3.4", t0 + Duration::from_millis(60_001))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

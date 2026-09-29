@@ -29,12 +29,21 @@
 //!   pending -> approved (terminal, key delivered once)
 //!   pending -> denied   (terminal)
 //!   any     -> expired  (passive, observed when expires_at < now)
+//!
+//! Poll pacing: the poll route has its own per-IP limiter sized from the
+//! advertised `interval` (see [`device_poll_rate_limit_config`]), not the
+//! shared brute-force limiter the other anonymous auth routes use. Anything
+//! over budget is answered with `slow_down` (RFC 8628 §3.5), never a 429.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Query, State},
-    http::StatusCode,
+    body::Body,
+    extract::{ConnectInfo, Extension, Query, State},
+    http::{Request, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
     Json,
 };
 use chrono::{Duration, Utc};
@@ -54,8 +63,9 @@ use crate::apikey_service::{ApiKeyServiceError, CreateApiKeyRequest};
 use crate::audit::LoginAudit;
 use crate::permission_guard;
 use crate::permissions::Role;
+use crate::rate_limit::{AuthRateLimitConfig, AuthRateLimiter};
 use crate::state::AuthState;
-use crate::RequireAuth;
+use crate::{resolve_client_ip, RequireAuth};
 
 /// How long a device-code session is valid before it auto-expires.
 const DEVICE_SESSION_TTL_SECS: i64 = 15 * 60;
@@ -63,6 +73,12 @@ const DEVICE_SESSION_TTL_SECS: i64 = 15 * 60;
 const POLL_INTERVAL_SECS: i64 = 2;
 /// Minimum spacing between polls. Anything tighter triggers `slow_down`.
 const MIN_POLL_SPACING_MS: i64 = 750;
+/// Window over which the per-IP poll limiter counts requests.
+const POLL_RATE_LIMIT_WINDOW_SECS: u64 = 60;
+/// How many device sessions polling at the advertised interval from one
+/// client IP the poll limiter admits at once (several people behind one NAT,
+/// or a login retried from a second terminal).
+const POLL_RATE_LIMIT_SESSIONS_PER_IP: u64 = 4;
 /// Lifetime for the API key minted by an approved device-code session.
 const CLI_KEY_TTL_DAYS: i64 = 90;
 /// Audit `login_method` value for device-code approvals.
@@ -220,6 +236,52 @@ impl From<CliDeviceFlowError> for Problem {
                 .with_detail(err.to_string()),
         }
     }
+}
+
+// ─── Poll rate limiting ─────────────────────────────────────────────────────
+
+/// Per-IP budget for `POST /auth/cli/device/poll`, derived from
+/// [`POLL_INTERVAL_SECS`] so the advertised interval and the limit cannot
+/// drift apart.
+///
+/// The poll route must stay off the shared brute-force limiter (10 requests
+/// per minute per IP, shared with login, MFA and password reset): one CLI
+/// polling at the advertised interval makes 30 requests a minute, so it was
+/// cut off with a generic 429 about 20 seconds in, before the user could
+/// approve. Polling needs no brute-force protection — the `device_code` is a
+/// 256-bit random secret — and per-session pacing is already enforced by the
+/// handler's `slow_down`. This limiter only bounds request volume per IP.
+pub(crate) fn device_poll_rate_limit_config() -> AuthRateLimitConfig {
+    let polls_per_window = POLL_RATE_LIMIT_WINDOW_SECS / POLL_INTERVAL_SECS.unsigned_abs().max(1);
+    let max_requests = polls_per_window * POLL_RATE_LIMIT_SESSIONS_PER_IP;
+    AuthRateLimitConfig {
+        max_requests: u32::try_from(max_requests).unwrap_or(u32::MAX),
+        window: std::time::Duration::from_secs(POLL_RATE_LIMIT_WINDOW_SECS),
+        ..AuthRateLimitConfig::default()
+    }
+}
+
+/// Per-IP rate limiting for the device-flow poll route.
+///
+/// An over-budget poll is answered with the same `slow_down` status the
+/// handler returns for a too-eager poller (RFC 8628 §3.5), so a client keeps
+/// waiting with a longer interval instead of aborting the login on a 429. It
+/// is decided before the body is parsed or the database is touched.
+pub(crate) async fn device_poll_rate_limit_middleware(
+    State(limiter): State<AuthRateLimiter>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let ip = resolve_client_ip(request.headers(), Some(peer));
+    if limiter.check(&ip).await.is_err() {
+        warn!(
+            "cli device poll: rate limit exceeded for IP {}, answering slow_down",
+            ip
+        );
+        return Json(CliDevicePollResponse::SlowDown).into_response();
+    }
+    next.run(request).await
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
@@ -1195,6 +1257,87 @@ mod tests {
             result.is_err(),
             "tampered ciphertext must NOT decrypt, got Ok({:?})",
             result.ok()
+        );
+    }
+
+    fn advertised_poll_interval() -> std::time::Duration {
+        std::time::Duration::from_secs(POLL_INTERVAL_SECS.unsigned_abs())
+    }
+
+    /// Replays `sessions` CLIs from one IP, each polling at the advertised
+    /// interval for the whole device-session lifetime (staggered within the
+    /// interval), and returns the first poll the limiter rejected, if any.
+    async fn first_limited_poll(sessions: u32) -> Option<(u32, u32)> {
+        let limiter = AuthRateLimiter::new(device_poll_rate_limit_config());
+        let start = std::time::Instant::now();
+        let interval = advertised_poll_interval();
+        let polls = u32::try_from(DEVICE_SESSION_TTL_SECS / POLL_INTERVAL_SECS).unwrap();
+        for poll in 0..polls {
+            for session in 0..sessions {
+                let at = start + interval * poll + (interval / sessions) * session;
+                if limiter.check_at("203.0.113.10", at).await.is_err() {
+                    return Some((session, poll));
+                }
+            }
+        }
+        None
+    }
+
+    /// A CLI polling at the advertised `interval` must never be rate limited
+    /// before the session expires. Under the shared brute-force limiter
+    /// (10 requests/minute) the 11th poll, about 20 seconds in, was rejected.
+    #[tokio::test]
+    async fn poll_limiter_admits_a_poller_at_the_advertised_interval_for_the_whole_session() {
+        assert_eq!(first_limited_poll(1).await, None);
+    }
+
+    /// Several logins polling from one IP (a shared NAT, a retried login)
+    /// stay within the budget too.
+    #[tokio::test]
+    async fn poll_limiter_admits_concurrent_pollers_from_one_ip() {
+        let sessions = u32::try_from(POLL_RATE_LIMIT_SESSIONS_PER_IP).unwrap();
+        assert_eq!(first_limited_poll(sessions).await, None);
+    }
+
+    /// The budget is finite: more pollers than it is sized for, or a burst,
+    /// are limited, and only for the offending IP.
+    #[tokio::test]
+    async fn poll_limiter_still_bounds_request_volume_per_ip() {
+        let sessions = u32::try_from(POLL_RATE_LIMIT_SESSIONS_PER_IP).unwrap() + 1;
+        assert!(first_limited_poll(sessions).await.is_some());
+
+        let config = device_poll_rate_limit_config();
+        let limiter = AuthRateLimiter::new(config.clone());
+        let now = std::time::Instant::now();
+        for i in 0..config.max_requests {
+            assert!(
+                limiter.check_at("198.51.100.20", now).await.is_ok(),
+                "burst request {i} is within the budget of {}",
+                config.max_requests
+            );
+        }
+        assert!(limiter.check_at("198.51.100.20", now).await.is_err());
+        assert!(limiter.check_at("198.51.100.21", now).await.is_ok());
+    }
+
+    /// The budget is derived from the advertised interval, so it covers at
+    /// least one poll per interval over the window for every session it is
+    /// sized for.
+    #[test]
+    fn poll_limit_is_derived_from_the_advertised_interval() {
+        let config = device_poll_rate_limit_config();
+        assert_eq!(
+            config.window,
+            std::time::Duration::from_secs(POLL_RATE_LIMIT_WINDOW_SECS)
+        );
+        let polls_per_window = config.window.as_secs() / advertised_poll_interval().as_secs();
+        assert_eq!(
+            u64::from(config.max_requests),
+            polls_per_window * POLL_RATE_LIMIT_SESSIONS_PER_IP
+        );
+        assert!(
+            config.max_requests > crate::rate_limit::AuthRateLimitConfig::default().max_requests,
+            "the poll budget must exceed the shared brute-force budget it replaced"
         );
     }
 }
