@@ -265,7 +265,11 @@ export class SessionRecorder {
         body: JSON.stringify(metadata),
       });
 
-      if (response.status === 201) {
+      // Any 2xx is success. The endpoint answers 201, but a same-origin proxy
+      // may relay it as 200. Requiring exactly 201 treated that as a failure:
+      // the server had already created the session, so each retry stranded
+      // another one before the recorder gave up without recording anything.
+      if (response.ok) {
         this.sessionInitialized = true;
         this.initRetryCount = 0;
         this.initFailed = false;

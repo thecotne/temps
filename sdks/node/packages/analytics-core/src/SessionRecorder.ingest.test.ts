@@ -295,3 +295,23 @@ describe("buffer bound", () => {
     expect(recorder.getDroppedEventCount()).toBe(15);
   });
 });
+
+/** Requests to the init endpoint, in order. */
+function initPosts(): unknown[] {
+  return fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/session-replay/init"));
+}
+
+describe("session init status", () => {
+  it("treats a 200 from /init as success, like the 201 the endpoint sends", async () => {
+    // A same-origin proxy can relay the endpoint's 201 as a 200. The session
+    // exists on the server either way, so rejecting it strands that session
+    // and every retry strands another.
+    fetchMock.mockResolvedValue({ status: 200, ok: true });
+
+    const recorder = newRecorder({ enabled: true });
+    await vi.waitFor(() => expect(recordCalls).toHaveLength(1));
+
+    expect(initPosts()).toHaveLength(1);
+    expect(recorder.getSessionId()).not.toBeNull();
+  });
+});
