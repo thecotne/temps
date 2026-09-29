@@ -40,6 +40,18 @@ use temps_metrics::{MetricsStore, TimescaleMetricsStore};
 
 // ── Configuration ───────────────────────────────────────────────────
 
+/// Former OTel retention variable. It was parsed into the config but never
+/// used by any storage path; the `observability_retention` settings are the
+/// only retention source. Still recognised so an operator who set it is told
+/// it has no effect instead of assuming it does.
+const REMOVED_RETENTION_DAYS_ENV: &str = "TEMPS_OTEL_RETENTION_DAYS";
+
+/// How often the ClickHouse `retention_days` stamp re-reads the
+/// `observability_retention` settings. A saved change reaches new rows within
+/// this interval without a restart. Each refresh is one read of the cached
+/// settings snapshot, so the cost is independent of data volume.
+const RETENTION_SETTINGS_SYNC_INTERVAL: Duration = Duration::from_secs(60);
+
 /// OTel subsystem configuration, read from environment variables.
 ///
 /// All settings have sensible defaults and are optional.
@@ -53,8 +65,9 @@ pub struct OtelConfig {
     pub s3_bucket: Option<String>,
     pub s3_prefix: String,
 
-    // Retention
-    pub retention_days: u32,
+    // Retention housekeeping. The retention windows themselves are the
+    // `observability_retention` settings (see `sync_clickhouse_retention`),
+    // not process configuration.
     pub retention_check_interval_secs: u64,
 
     // Rate limiting
@@ -91,7 +104,6 @@ impl Default for OtelConfig {
             s3_secret_key: None,
             s3_bucket: None,
             s3_prefix: "otel-logs".to_string(),
-            retention_days: 7,
             retention_check_interval_secs: 3600, // 1 hour
             rate_limit_requests: 1000,
             rate_limit_window_secs: 60,
@@ -134,10 +146,14 @@ impl OtelConfig {
         if let Ok(v) = std::env::var("TEMPS_OTEL_S3_PREFIX") {
             config.s3_prefix = v;
         }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_RETENTION_DAYS") {
-            if let Ok(days) = v.parse() {
-                config.retention_days = days;
-            }
+        if std::env::var_os(REMOVED_RETENTION_DAYS_ENV).is_some() {
+            warn!(
+                variable = REMOVED_RETENTION_DAYS_ENV,
+                "{REMOVED_RETENTION_DAYS_ENV} is set but is no longer read: it never controlled \
+                 how long OTel data is kept. Retention is the observability_retention setting \
+                 (Settings > Metrics Monitoring, or PUT /api/settings), which applies to \
+                 TimescaleDB and, when configured, ClickHouse. Unset the variable."
+            );
         }
         if let Ok(v) = std::env::var("TEMPS_OTEL_RATE_LIMIT") {
             if let Ok(limit) = v.parse() {
@@ -649,7 +665,6 @@ impl TempsPlugin for OtelPlugin {
             let timescale_storage = Arc::new(TimescaleDbStorage::with_config(
                 db.clone(),
                 s3_client,
-                config.retention_days,
                 config.quota_bytes_per_project,
                 Some(facet_cache.clone()),
             ));
@@ -660,12 +675,33 @@ impl TempsPlugin for OtelPlugin {
                     database = %ch_cfg.database,
                     "ClickHouse OTel backend enabled (ADR-016) — applying migrations"
                 );
-                // Slot defaults to FixedRetentionResolver; a plugin (e.g. one
-                // implementing per-project data retention policies) is wired
-                // in later from `initialize_plugin_services` — see the
+                // Rows are stamped with the operator's observability_retention
+                // windows (otel_spans_days / otel_metrics_days). The resolver is
+                // loaded before the storage exists, so the first batch after
+                // boot already carries the configured value, and refreshed in
+                // the background afterwards.
+                let settings_retention = Arc::new(temps_core::SettingsRetentionResolver::new());
+                match context.get_service::<temps_config::ConfigService>() {
+                    Some(config_service) => {
+                        sync_clickhouse_retention(&config_service, &settings_retention).await;
+                        spawn_clickhouse_retention_sync(config_service, settings_retention.clone());
+                    }
+                    None => warn!(
+                        spans_days = settings_retention.days(temps_core::RetentionTable::Spans),
+                        metrics_days = settings_retention.days(temps_core::RetentionTable::Metrics),
+                        "ConfigService is not registered; ClickHouse OTel rows use the default \
+                         retention and ignore the observability_retention settings"
+                    ),
+                }
+                // The settings resolver is only the slot's default: a plugin
+                // (e.g. one implementing per-project data retention policies)
+                // is wired in later from `initialize_plugin_services` and then
+                // decides every row's window — see the
                 // `retention_resolver_slot` field doc for why a direct
                 // `get_service` call here would never find it.
-                let retention_slot = Arc::new(temps_core::RetentionResolverSlot::new_default());
+                let retention_slot = Arc::new(temps_core::RetentionResolverSlot::with_default(
+                    settings_retention as Arc<dyn temps_core::RetentionResolver>,
+                ));
                 let _ = self.retention_resolver_slot.set(retention_slot.clone());
                 let ch_storage = Arc::new(ClickHouseOtelStorage::new(
                     ch_cfg.clone(),
@@ -1356,15 +1392,14 @@ impl TempsPlugin for OtelPlugin {
             // else still finishing during startup. Future hooks should
             // wait one full interval before their first run.
             let retention_storage = storage.clone();
-            let retention_days = config.retention_days;
             let retention_interval = config.retention_check_interval_secs;
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(retention_interval));
                 interval.tick().await; // discard the immediate first tick
                 loop {
                     interval.tick().await;
-                    debug!(retention_days, "Running OTel data retention cleanup");
-                    if let Err(e) = apply_retention_all(&retention_storage, retention_days).await {
+                    debug!("Running OTel data retention cleanup");
+                    if let Err(e) = apply_retention_all(&retention_storage).await {
                         error!(error = %e, "OTel retention cleanup failed");
                     }
                 }
@@ -1675,7 +1710,6 @@ impl TempsPlugin for OtelPlugin {
             }
 
             debug!(
-                retention_days = config.retention_days,
                 rate_limit = config.rate_limit_requests,
                 s3_enabled = config.has_s3_config(),
                 "OTel plugin services registered successfully"
@@ -1897,17 +1931,72 @@ fn read_clickhouse_otel_config_from_env() -> Option<ClickHouseOtelConfig> {
 /// Apply retention across all projects by scanning the tables for distinct project IDs.
 async fn apply_retention_all(
     storage: &Arc<dyn crate::storage::OtelStorage>,
-    retention_days: u32,
 ) -> Result<(), crate::error::OtelError> {
     // Get distinct project IDs from metric names (lightweight query)
     // In a production system, you'd have a dedicated project registry.
-    // For now, we apply retention for project_id=0 which acts as a global sweep
-    // using the configured retention_days.
+    // For now, we apply retention for project_id=0 which acts as a global sweep.
     let deleted = storage.apply_retention(0).await?;
     if deleted > 0 {
-        info!(deleted, retention_days, "OTel retention cleanup completed");
+        info!(deleted, "OTel retention cleanup completed");
     }
     Ok(())
+}
+
+/// Load the current `observability_retention` windows into `resolver`, the
+/// value ClickHouse OTel ingest stamps onto each new row's `retention_days`.
+///
+/// Returns `true` when a window changed. A failed settings read keeps the
+/// values the resolver already holds (the defaults on first boot) rather than
+/// guessing: a stale window is corrected by the next refresh, while a wrong
+/// one invented here would be written onto rows that outlive the blip.
+async fn sync_clickhouse_retention(
+    config: &temps_config::ConfigService,
+    resolver: &temps_core::SettingsRetentionResolver,
+) -> bool {
+    use temps_core::RetentionTable;
+
+    match config.get_settings().await {
+        Ok(settings) => {
+            let changed = resolver.apply(&settings.observability_retention);
+            if changed {
+                info!(
+                    spans_days = resolver.days(RetentionTable::Spans),
+                    metrics_days = resolver.days(RetentionTable::Metrics),
+                    "ClickHouse OTel retention follows observability_retention settings; \
+                     applies to spans and metrics ingested from now on"
+                );
+            }
+            changed
+        }
+        Err(error) => {
+            warn!(
+                %error,
+                spans_days = resolver.days(RetentionTable::Spans),
+                metrics_days = resolver.days(RetentionTable::Metrics),
+                "Could not read observability_retention settings; ClickHouse OTel ingest keeps \
+                 its current retention until the next refresh"
+            );
+            false
+        }
+    }
+}
+
+/// Keep `resolver` in step with the settings: re-read them every
+/// [`RETENTION_SETTINGS_SYNC_INTERVAL`] so a saved change applies without a
+/// restart. The caller has already done the initial load.
+fn spawn_clickhouse_retention_sync(
+    config: Arc<temps_config::ConfigService>,
+    resolver: Arc<temps_core::SettingsRetentionResolver>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(RETENTION_SETTINGS_SYNC_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await; // the first tick fires immediately; already loaded
+        loop {
+            interval.tick().await;
+            sync_clickhouse_retention(&config, &resolver).await;
+        }
+    });
 }
 
 #[cfg(test)]
@@ -2052,7 +2141,7 @@ mod tests {
     #[test]
     fn test_otel_config_default() {
         let config = OtelConfig::default();
-        assert_eq!(config.retention_days, 7);
+        assert_eq!(config.retention_check_interval_secs, 3600);
         assert_eq!(config.rate_limit_requests, 1000);
         assert_eq!(config.rate_limit_window_secs, 60);
         assert_eq!(config.quota_bytes_per_project, None);
@@ -2319,5 +2408,139 @@ mod tests {
 
         assert!(routes.is_some());
         assert!(!auth_service.has_project_access_checker());
+    }
+
+    // ── ClickHouse retention settings sync ──────────────────────────────
+
+    use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+    use temps_core::{
+        AppSettings, ObservabilityRetentionSettings, RetentionTable, SettingsRetentionResolver,
+    };
+
+    /// A ServerConfig built in memory. `ServerConfig::new` creates a data
+    /// directory and installation secrets on disk, which a unit test must not.
+    fn test_server_config() -> Arc<temps_config::ServerConfig> {
+        Arc::new(temps_config::ServerConfig {
+            address: "127.0.0.1:0".into(),
+            database_url: "postgres://test".into(),
+            tls_address: None,
+            console_address: "127.0.0.1:0".into(),
+            console_admin_address: None,
+            admin_allowed_ips: Vec::new(),
+            admin_allowed_hosts: Vec::new(),
+            admin_trust_forwarded_for: false,
+            data_dir: std::path::PathBuf::from("/tmp/temps-otel-retention-sync-tests"),
+            auth_secret: "default-32-byte-key-for-testing!".into(),
+            encryption_key: "another-32-byte-key-for-testing!".into(),
+            api_base_url: "/api".into(),
+            postgres_max_connections: None,
+            postgres_min_connections: None,
+            postgres_connect_timeout_secs: None,
+            postgres_acquire_timeout_secs: None,
+            postgres_idle_timeout_secs: None,
+            postgres_max_lifetime_secs: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
+            clickhouse_password: None,
+            docker_extra_networks: Vec::new(),
+        })
+    }
+
+    fn settings_row(retention: ObservabilityRetentionSettings) -> temps_entities::settings::Model {
+        let settings = AppSettings {
+            observability_retention: retention,
+            ..AppSettings::default()
+        };
+        temps_entities::settings::Model {
+            id: 1,
+            data: settings.to_json(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn retention(spans: u32, metrics: u32) -> ObservabilityRetentionSettings {
+        ObservabilityRetentionSettings {
+            otel_spans_days: spans,
+            otel_metrics_days: metrics,
+            ..ObservabilityRetentionSettings::default()
+        }
+    }
+
+    fn config_service(db: MockDatabase) -> temps_config::ConfigService {
+        temps_config::ConfigService::new(test_server_config(), Arc::new(db.into_connection()))
+    }
+
+    #[tokio::test]
+    async fn test_sync_clickhouse_retention_applies_saved_settings() {
+        let config = config_service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![settings_row(retention(7, 14))]]),
+        );
+        let resolver = SettingsRetentionResolver::new();
+
+        assert!(sync_clickhouse_retention(&config, &resolver).await);
+
+        assert_eq!(resolver.days(RetentionTable::Spans), 7);
+        assert_eq!(resolver.days(RetentionTable::Metrics), 14);
+        // The same value for every project: this is the installation setting.
+        use temps_core::RetentionResolver;
+        assert_eq!(resolver.resolve(12, RetentionTable::Spans), 7);
+    }
+
+    #[tokio::test]
+    async fn test_sync_clickhouse_retention_reports_no_change_for_same_settings() {
+        let config = config_service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![settings_row(retention(7, 14))]]),
+        );
+        let resolver = SettingsRetentionResolver::from_settings(&retention(7, 14));
+
+        assert!(!sync_clickhouse_retention(&config, &resolver).await);
+        assert_eq!(resolver.days(RetentionTable::Spans), 7);
+    }
+
+    #[tokio::test]
+    async fn test_sync_clickhouse_retention_keeps_values_when_settings_read_fails() {
+        let config = config_service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("settings row unavailable".into())]),
+        );
+        let resolver = SettingsRetentionResolver::from_settings(&retention(7, 14));
+
+        assert!(!sync_clickhouse_retention(&config, &resolver).await);
+
+        // A read failure must not reset the stamp to the 90-day default.
+        assert_eq!(resolver.days(RetentionTable::Spans), 7);
+        assert_eq!(resolver.days(RetentionTable::Metrics), 14);
+    }
+
+    #[tokio::test]
+    async fn test_sync_clickhouse_retention_without_settings_row_uses_defaults() {
+        // No settings row means nothing was ever saved: the defaults apply.
+        let config = config_service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::settings::Model>::new()]),
+        );
+        let resolver = SettingsRetentionResolver::from_settings(&retention(7, 14));
+
+        assert!(sync_clickhouse_retention(&config, &resolver).await);
+        assert_eq!(resolver.days(RetentionTable::Spans), 90);
+        assert_eq!(resolver.days(RetentionTable::Metrics), 90);
+    }
+
+    #[tokio::test]
+    async fn test_sync_clickhouse_retention_clamps_a_zero_day_setting() {
+        // Stored JSON can predate API validation; a 0 must never reach a row.
+        let config = config_service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![settings_row(retention(0, 0))]]),
+        );
+        let resolver = SettingsRetentionResolver::new();
+
+        assert!(sync_clickhouse_retention(&config, &resolver).await);
+        assert_eq!(resolver.days(RetentionTable::Spans), 1);
+        assert_eq!(resolver.days(RetentionTable::Metrics), 1);
     }
 }

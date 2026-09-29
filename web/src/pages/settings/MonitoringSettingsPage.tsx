@@ -775,115 +775,95 @@ export function MonitoringSettingsPage() {
                     deletes rows older than 30 days using its native TTL.
                   </p>
                 </div>
-                <div className="rounded-lg border bg-muted/30 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="text-sm font-medium">OTel metric points</p>
-                    <code className="rounded bg-background px-2 py-0.5 text-[11px] text-muted-foreground ring-1 ring-inset ring-border">
-                      metrics
-                    </code>
-                  </div>
-                  <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                    Application metrics received over OTLP. ClickHouse
-                    permanently deletes rows older than 90 days using its native
-                    TTL.
-                  </p>
-                </div>
-                <div className="rounded-lg border bg-muted/30 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="text-sm font-medium">OTel spans / traces</p>
-                    <code className="rounded bg-background px-2 py-0.5 text-[11px] text-muted-foreground ring-1 ring-inset ring-border">
-                      spans
-                    </code>
-                  </div>
-                  <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                    Individual operations that compose a distributed trace,
-                    including timings, errors, attributes, and service links.
-                    ClickHouse permanently deletes rows older than 90 days using
-                    its native TTL.
-                  </p>
-                </div>
               </div>
             )}
 
             <div className="grid gap-4 md:grid-cols-2">
               {effectiveObservabilityStore !== 'click_house' && (
-                <>
-                  <div className="space-y-3 rounded-lg border p-4">
-                    <div className="flex items-center justify-between gap-3">
-                      <Label htmlFor="retention-proxy-logs">
-                        Proxy request logs
-                      </Label>
-                      <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
-                        proxy_logs
-                      </code>
-                    </div>
-                    <p className="min-h-10 text-xs leading-5 text-muted-foreground">
-                      Stores a separate log entry for every HTTP request handled
-                      by the proxy. Use these entries to investigate traffic,
-                      status codes, and slow requests.
-                    </p>
-                    <DurationInput
-                      id="retention-proxy-logs"
-                      unit="days"
-                      min={1}
-                      max={3650}
-                      {...register('observability_retention.proxy_logs_days', {
-                        valueAsNumber: true,
-                        required: true,
-                        min: { value: 1, message: 'Min 1 day' },
-                        max: { value: 3650, message: 'Max 3650 days' },
-                      })}
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      Proxy log entries older than this are permanently deleted.
-                      Range 1–3650 days; default 30.
-                    </p>
-                    {errors.observability_retention?.proxy_logs_days && (
-                      <p className="text-xs text-destructive">
-                        {errors.observability_retention.proxy_logs_days.message}
-                      </p>
-                    )}
+                <div className="space-y-3 rounded-lg border p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <Label htmlFor="retention-proxy-logs">
+                      Proxy request logs
+                    </Label>
+                    <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                      proxy_logs
+                    </code>
                   </div>
-
-                  <div className="space-y-3 rounded-lg border p-4">
-                    <div className="flex items-center justify-between gap-3">
-                      <Label htmlFor="retention-otel-spans">
-                        OTel spans / traces
-                      </Label>
-                      <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
-                        otel_spans
-                      </code>
-                    </div>
-                    <p className="min-h-10 text-xs leading-5 text-muted-foreground">
-                      Stores every received OTel span used to reconstruct trace
-                      waterfalls, follow requests across services, and inspect
-                      timings, errors, events, and attributes.
+                  <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                    Stores a separate log entry for every HTTP request handled
+                    by the proxy. Use these entries to investigate traffic,
+                    status codes, and slow requests.
+                  </p>
+                  <DurationInput
+                    id="retention-proxy-logs"
+                    unit="days"
+                    min={1}
+                    max={3650}
+                    {...register('observability_retention.proxy_logs_days', {
+                      valueAsNumber: true,
+                      required: true,
+                      min: { value: 1, message: 'Min 1 day' },
+                      max: { value: 3650, message: 'Max 3650 days' },
+                    })}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Proxy log entries older than this are permanently deleted.
+                    Range 1–3650 days; default 30.
+                  </p>
+                  {errors.observability_retention?.proxy_logs_days && (
+                    <p className="text-xs text-destructive">
+                      {errors.observability_retention.proxy_logs_days.message}
                     </p>
-                    <DurationInput
-                      id="retention-otel-spans"
-                      unit="days"
-                      min={1}
-                      max={3650}
-                      {...register('observability_retention.otel_spans_days', {
-                        valueAsNumber: true,
-                        required: true,
-                        min: { value: 1, message: 'Min 1 day' },
-                        max: { value: 3650, message: 'Max 3650 days' },
-                      })}
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      Spans older than this are permanently deleted and
-                      disappear from trace search and detail views. Range 1–3650
-                      days; default 90.
-                    </p>
-                    {errors.observability_retention?.otel_spans_days && (
-                      <p className="text-xs text-destructive">
-                        {errors.observability_retention.otel_spans_days.message}
-                      </p>
-                    )}
-                  </div>
-                </>
+                  )}
+                </div>
               )}
+
+              <div className="space-y-3 rounded-lg border p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="retention-otel-spans">
+                    OTel spans / traces
+                  </Label>
+                  <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                    {effectiveObservabilityStore === 'click_house'
+                      ? 'spans'
+                      : 'otel_spans'}
+                  </code>
+                </div>
+                <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                  Stores every received OTel span used to reconstruct trace
+                  waterfalls, follow requests across services, and inspect
+                  timings, errors, events, and attributes.
+                </p>
+                <DurationInput
+                  id="retention-otel-spans"
+                  unit="days"
+                  min={1}
+                  max={3650}
+                  {...register('observability_retention.otel_spans_days', {
+                    valueAsNumber: true,
+                    required: true,
+                    min: { value: 1, message: 'Min 1 day' },
+                    max: { value: 3650, message: 'Max 3650 days' },
+                  })}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Spans older than this are permanently deleted and disappear
+                  from trace search and detail views. Range 1–3650 days; default
+                  90.
+                </p>
+                {effectiveObservabilityStore === 'click_house' && (
+                  <p className="text-xs text-muted-foreground">
+                    ClickHouse stores the window on each span as it arrives, so
+                    a change applies to spans received after saving. Spans
+                    already stored keep the window they arrived with.
+                  </p>
+                )}
+                {errors.observability_retention?.otel_spans_days && (
+                  <p className="text-xs text-destructive">
+                    {errors.observability_retention.otel_spans_days.message}
+                  </p>
+                )}
+              </div>
 
               <div className="space-y-3 rounded-lg border p-4">
                 <div className="flex items-center justify-between gap-3">
@@ -1032,44 +1012,51 @@ export function MonitoringSettingsPage() {
                 )}
               </div>
 
-              {effectiveObservabilityStore !== 'click_house' && (
-                <div className="space-y-3 rounded-lg border p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <Label htmlFor="retention-otel-metrics">
-                      OTel metric points
-                    </Label>
-                    <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
-                      otel_metrics
-                    </code>
-                  </div>
-                  <p className="min-h-10 text-xs leading-5 text-muted-foreground">
-                    Stores application metric points sent by OpenTelemetry SDKs
-                    and collectors. These are separate from the Temps-scraped
-                    resource metrics configured above.
-                  </p>
-                  <DurationInput
-                    id="retention-otel-metrics"
-                    unit="days"
-                    min={1}
-                    max={3650}
-                    {...register('observability_retention.otel_metrics_days', {
-                      valueAsNumber: true,
-                      required: true,
-                      min: { value: 1, message: 'Min 1 day' },
-                      max: { value: 3650, message: 'Max 3650 days' },
-                    })}
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    OTel metric points older than this are permanently deleted.
-                    Range 1–3650 days; default 90.
-                  </p>
-                  {errors.observability_retention?.otel_metrics_days && (
-                    <p className="text-xs text-destructive">
-                      {errors.observability_retention.otel_metrics_days.message}
-                    </p>
-                  )}
+              <div className="space-y-3 rounded-lg border p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="retention-otel-metrics">
+                    OTel metric points
+                  </Label>
+                  <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                    {effectiveObservabilityStore === 'click_house'
+                      ? 'metrics'
+                      : 'otel_metrics'}
+                  </code>
                 </div>
-              )}
+                <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                  Stores application metric points sent by OpenTelemetry SDKs
+                  and collectors. These are separate from the Temps-scraped
+                  resource metrics configured above.
+                </p>
+                <DurationInput
+                  id="retention-otel-metrics"
+                  unit="days"
+                  min={1}
+                  max={3650}
+                  {...register('observability_retention.otel_metrics_days', {
+                    valueAsNumber: true,
+                    required: true,
+                    min: { value: 1, message: 'Min 1 day' },
+                    max: { value: 3650, message: 'Max 3650 days' },
+                  })}
+                />
+                <p className="text-xs text-muted-foreground">
+                  OTel metric points older than this are permanently deleted.
+                  Range 1–3650 days; default 90.
+                </p>
+                {effectiveObservabilityStore === 'click_house' && (
+                  <p className="text-xs text-muted-foreground">
+                    ClickHouse stores the window on each point as it arrives, so
+                    a change applies to points received after saving. Points
+                    already stored keep the window they arrived with.
+                  </p>
+                )}
+                {errors.observability_retention?.otel_metrics_days && (
+                  <p className="text-xs text-destructive">
+                    {errors.observability_retention.otel_metrics_days.message}
+                  </p>
+                )}
+              </div>
             </div>
           </section>
         </div>

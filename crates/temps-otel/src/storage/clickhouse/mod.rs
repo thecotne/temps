@@ -516,7 +516,8 @@ impl From<ChSpanRow> for SpanRecord {
 
 // ── Metric row type ───────────────────────────────────────────────────────
 
-/// ClickHouse row matching the `metrics` table DDL in `0003_metrics.sql`.
+/// ClickHouse row matching the `metrics` table DDL in `0003_metrics.sql`, plus
+/// the `retention_days` column appended by `0009_metrics_retention_days.sql`.
 ///
 /// **Field order must match the DDL column order exactly.** The `clickhouse`
 /// crate serialises fields positionally (binary protocol over HTTP); any
@@ -634,14 +635,25 @@ pub struct ChMetricRow {
     // ── Dedup key ───────────────────────────────────────────────────────────
     /// _version  UInt64  DEFAULT toUnixTimestamp64Milli(now64())
     pub _version: u64,
+
+    // ── Retention ───────────────────────────────────────────────────────────
+    /// retention_days  UInt16  DEFAULT 90
+    ///
+    /// Added by migration 0009_metrics_retention_days.sql, which also points
+    /// the table TTL at it. Stamped at ingest from the storage's
+    /// `RetentionResolver` (`RetentionTable::Metrics`), i.e. the operator's
+    /// `observability_retention.otel_metrics_days` unless a plugin overrides
+    /// it per project.
+    pub retention_days: u16,
 }
 
-/// The number of named columns in the `metrics` DDL (`0003_metrics.sql`),
-/// excluding the `_version` dedup sentinel. The [`ChMetricRow`] struct must have
-/// exactly this many domain fields, in the same order. Bump together with the
-/// DDL when the schema changes. Used by the field-order guard test.
+/// The number of named columns in the `metrics` DDL (`0003_metrics.sql` plus
+/// the columns later migrations append), excluding the `_version` dedup
+/// sentinel. The [`ChMetricRow`] struct must have exactly this many domain
+/// fields, in the same order. Bump together with the DDL when the schema
+/// changes. Used by the field-order guard test.
 #[allow(dead_code)]
-pub(crate) const CH_METRIC_ROW_FIELD_COUNT: usize = 31;
+pub(crate) const CH_METRIC_ROW_FIELD_COUNT: usize = 32;
 
 impl From<&MetricPoint> for ChMetricRow {
     fn from(p: &MetricPoint) -> Self {
@@ -713,6 +725,9 @@ impl From<&MetricPoint> for ChMetricRow {
             exemplars,
             attributes,
             _version: version,
+            // Callers that hold a RetentionResolver should override this field
+            // after construction. The fixed default matches the DDL DEFAULT.
+            retention_days: temps_core::RetentionTable::Metrics.default_days(),
         }
     }
 }
@@ -1322,8 +1337,10 @@ pub struct ClickHouseOtelStorage {
     /// with native CH queries one method at a time.
     inner: Arc<TimescaleDbStorage>,
     /// Resolves the per-project `retention_days` value stamped onto each
-    /// ingested span row. The default [`temps_core::FixedRetentionResolver`]
-    /// always returns 90; a plugin can register an alternative implementation.
+    /// ingested span, trace-ref and metric row. The OTel plugin passes a slot
+    /// defaulting to [`temps_core::SettingsRetentionResolver`] (the operator's
+    /// `observability_retention` setting); a plugin can register an
+    /// alternative implementation.
     resolver: Arc<dyn temps_core::RetentionResolver>,
     /// Shared facet cache: attribute_key → slot (1..=20).
     ///
@@ -1342,9 +1359,10 @@ impl ClickHouseOtelStorage {
     ///   methods and (during Phase 0) span reads. Callers typically pass
     ///   the same `Arc<TimescaleDbStorage>` they would have registered
     ///   without ClickHouse.
-    /// - `resolver`: resolves per-project `retention_days` at ingest time.
-    ///   Pass `Arc::new(FixedRetentionResolver)` unless a plugin has
-    ///   registered a project-aware implementation.
+    /// - `resolver`: resolves per-project `retention_days` at ingest time for
+    ///   spans, trace refs and metrics. Pass `Arc::new(FixedRetentionResolver)`
+    ///   for the table defaults, or a resolver following settings or a
+    ///   plugin's per-project policy.
     /// - `facet_cache`: shared attribute-key→slot mapping. Pass `None` if
     ///   `FacetService` is not registered; all facet columns will be NULL.
     pub fn new(
@@ -2896,7 +2914,10 @@ impl OtelStorage for ClickHouseOtelStorage {
                 .map_err(|e| ch_ingest_err("store_metrics (inserter setup)", e))?;
 
             for point in chunk {
-                let row = ChMetricRow::from(*point);
+                let mut row = ChMetricRow::from(*point);
+                row.retention_days = self
+                    .resolver
+                    .resolve(point.project_id, temps_core::RetentionTable::Metrics);
                 inserter
                     .write(&row)
                     .await
@@ -4242,10 +4263,24 @@ mod tests {
             exemplars: _,
             attributes: _,
             _version: _,
+            retention_days: _,
         } = row;
-        // 31 domain columns + _version sentinel = 32 serialised fields; the DDL
-        // declares 31 named columns plus _version, matching this destructure.
-        assert_eq!(CH_METRIC_ROW_FIELD_COUNT, 31);
+        // 32 domain columns + _version sentinel = 33 serialised fields: the
+        // 31 named columns plus _version from 0003, and retention_days from
+        // 0009, matching this destructure.
+        assert_eq!(CH_METRIC_ROW_FIELD_COUNT, 32);
+    }
+
+    #[test]
+    fn metric_row_defaults_retention_to_the_column_default() {
+        // store_metrics overwrites this from the resolver; the From impl alone
+        // must match the DDL DEFAULT so an un-stamped row keeps the old TTL.
+        let row = ChMetricRow::from(&make_gauge());
+        assert_eq!(row.retention_days, 90);
+        assert_eq!(
+            row.retention_days,
+            temps_core::RetentionTable::Metrics.default_days()
+        );
     }
 
     #[test]
@@ -4551,6 +4586,12 @@ mod tests {
         // (derived from clickhouse::Row), so a future reorder of either side
         // fails loudly here instead of corrupting data at runtime.
         let ddl = include_str!("../../../migrations/clickhouse/0003_metrics.sql");
+        // Later migrations append columns with `ALTER TABLE metrics ADD COLUMN`;
+        // ClickHouse places those after every existing column, in migration
+        // order.
+        let appended_columns_ddl = [include_str!(
+            "../../../migrations/clickhouse/0009_metrics_retention_days.sql"
+        )];
 
         // Extract the column names from the `CREATE TABLE metrics ( ... )` body.
         let create_start = ddl
@@ -4589,6 +4630,19 @@ mod tests {
             }
             ddl_columns.push(token.to_string());
         }
+        for migration in appended_columns_ddl {
+            for line in migration.lines().map(str::trim) {
+                if line.starts_with("--") {
+                    continue;
+                }
+                if let Some(rest) =
+                    line.strip_prefix("ALTER TABLE metrics ADD COLUMN IF NOT EXISTS ")
+                {
+                    let column = rest.split_whitespace().next().unwrap_or("");
+                    ddl_columns.push(column.to_string());
+                }
+            }
+        }
 
         // The ChMetricRow field order, declared once here and kept in lockstep
         // with the struct definition above. Any change to the struct field list
@@ -4626,9 +4680,10 @@ mod tests {
             "exemplars",
             "attributes",
             "_version",
+            "retention_days",
         ];
 
-        // 31 domain columns + _version sentinel.
+        // 32 domain columns + _version sentinel.
         assert_eq!(
             row_fields.len(),
             CH_METRIC_ROW_FIELD_COUNT + 1,

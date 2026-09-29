@@ -59,6 +59,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "0008_facet_slots",
         sql: include_str!("../../../migrations/clickhouse/0008_facet_slots.sql"),
     },
+    Migration {
+        name: "0009_metrics_retention_days",
+        sql: include_str!("../../../migrations/clickhouse/0009_metrics_retention_days.sql"),
+    },
 ];
 
 /// SQL for the migration tracking table. Created on first run.
@@ -207,6 +211,20 @@ pub async fn apply_migrations(
             })?;
 
         report.applied.push(migration.name);
+    }
+
+    // 6. Drop the client's cached table schemas.
+    //
+    // With validation on (the default), the `clickhouse` client DESCRIBEs a
+    // table on its first insert and caches the column list for the lifetime
+    // of the process, shared by every clone of the client (the storage
+    // backend's included). Migrations run in the background at startup, so an
+    // OTLP batch can arrive first and cache the pre-migration schema. Every
+    // later insert of a row type that has a newly added column (e.g.
+    // `retention_days` on `metrics`) would then fail its schema check until a
+    // restart. Clearing after DDL makes the next insert re-read the schema.
+    if !report.applied.is_empty() {
+        client.clear_cached_metadata().await;
     }
 
     Ok(report)
@@ -361,6 +379,93 @@ mod tests {
     fn hyphen_in_database_name_is_rejected() {
         let err = validate_database_name("my-db").unwrap_err();
         assert!(err.to_string().contains('-'));
+    }
+
+    /// Split a migration exactly the way `execute_multi` does.
+    fn runnable_statements(sql: &str) -> Vec<String> {
+        strip_whole_line_comments(sql)
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn migration_sql(name: &str) -> &'static str {
+        MIGRATIONS
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("migration {name} must be registered"))
+            .sql
+    }
+
+    /// Tracking rows are keyed by name and applied in list order, so names
+    /// must be unique and their numeric prefixes strictly increasing.
+    #[test]
+    fn migration_names_are_unique_and_ordered() {
+        let prefixes: Vec<u32> = MIGRATIONS
+            .iter()
+            .map(|m| {
+                m.name
+                    .split('_')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or_else(|| panic!("{} must start with a number", m.name))
+            })
+            .collect();
+        assert!(
+            prefixes.windows(2).all(|pair| pair[0] < pair[1]),
+            "migration numbers must be strictly increasing: {prefixes:?}"
+        );
+    }
+
+    /// The metrics retention migration adds the column the insert row writes
+    /// and points the TTL at it, without the MATERIALIZE TTL mutation.
+    #[test]
+    fn metrics_retention_migration_adds_column_and_per_row_ttl() {
+        let statements = runnable_statements(migration_sql("0009_metrics_retention_days"));
+        assert_eq!(statements.len(), 2, "got: {statements:?}");
+
+        assert_eq!(
+            statements[0],
+            "ALTER TABLE metrics ADD COLUMN IF NOT EXISTS retention_days UInt16 DEFAULT 90"
+        );
+        assert_eq!(
+            statements[1],
+            "ALTER TABLE metrics MODIFY TTL toDateTime(timestamp) + toIntervalDay(retention_days) \
+             SETTINGS materialize_ttl_after_modify = 0"
+        );
+    }
+
+    /// The column DEFAULT is the old fixed interval, which is what makes the
+    /// new TTL expression value-identical for rows stored before the
+    /// migration (and skipping MATERIALIZE TTL safe).
+    #[test]
+    fn metrics_retention_default_matches_previous_fixed_ttl() {
+        assert!(
+            migration_sql("0003_metrics").contains("TTL toDateTime(timestamp) + INTERVAL 90 DAY"),
+            "0003 must still declare the 90-day TTL the new DEFAULT replaces"
+        );
+        let default_days = temps_core::RetentionTable::Metrics.default_days();
+        assert!(
+            migration_sql("0009_metrics_retention_days")
+                .contains(&format!("retention_days UInt16 DEFAULT {default_days}")),
+            "column DEFAULT must equal RetentionTable::Metrics.default_days()"
+        );
+    }
+
+    /// Spans kept their own per-row TTL (0004/0005); a metrics change must not
+    /// have drifted it.
+    #[test]
+    fn spans_ttl_still_reads_retention_days() {
+        let statements = runnable_statements(migration_sql("0005_retention_ttl"));
+        assert_eq!(
+            statements,
+            vec!["ALTER TABLE spans MODIFY TTL toDateTime(start_time) + toIntervalDay(retention_days)"]
+        );
+        let default_days = temps_core::RetentionTable::Spans.default_days();
+        assert!(migration_sql("0004_retention_days")
+            .contains(&format!("retention_days UInt16 DEFAULT {default_days}")));
     }
 
     /// Every migration in MIGRATIONS must yield at least one runnable statement

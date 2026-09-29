@@ -1561,6 +1561,13 @@ impl Default for ObservabilityCompressionSettings {
     }
 }
 
+// Where each value is enforced: the Settings API turns them into TimescaleDB
+// retention policies, and with ClickHouse configured the OTel plugin stamps
+// `otel_spans_days` / `otel_metrics_days` onto the `retention_days` column of
+// each new `spans` / `metrics` row, which the per-row TTL reads (see
+// `crate::retention::SettingsRetentionResolver`). ClickHouse `proxy_logs`
+// rows still carry the column default. Kept out of the doc comment below
+// because that text is the published OpenAPI schema description.
 /// Retention policy configuration for raw observability tables. Values are in
 /// days. The Settings API applies them to TimescaleDB; ClickHouse-backed proxy
 /// logs and spans retain their storage-level per-row TTL behavior.
