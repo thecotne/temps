@@ -743,10 +743,6 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
             "/auth/cli/device/start",
             post(crate::cli_device_handler::cli_device_start),
         )
-        .route(
-            "/auth/cli/device/poll",
-            post(crate::cli_device_handler::cli_device_poll),
-        )
         .route("/auth/password-reset/request", post(request_password_reset))
         .route("/auth/password-reset/verify", post(reset_password))
         .route(
@@ -774,6 +770,20 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         // everything before it, seeing the request first.
         .layer(axum::middleware::from_fn(auth_rate_limit_middleware))
         .layer(axum::Extension(rate_limiter));
+
+    // The CLI device-flow poll endpoint is polled every few seconds for up
+    // to the whole session lifetime, which the brute-force limiter above
+    // cannot accommodate. It gets its own limiter, sized from the advertised
+    // polling interval, that answers `slow_down` instead of 429.
+    let device_poll_routes = Router::new()
+        .route(
+            "/auth/cli/device/poll",
+            post(crate::cli_device_handler::cli_device_poll),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            AuthRateLimiter::new(crate::cli_device_handler::device_poll_rate_limit_config()),
+            crate::cli_device_handler::device_poll_rate_limit_middleware,
+        ));
 
     // Non-rate-limited routes (require authentication already)
     let authenticated_routes = Router::new()
@@ -811,7 +821,9 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route("/users/{user_id}/roles", post(assign_role))
         .route("/users/{user_id}/roles/{role_type}", delete(remove_role));
 
-    rate_limited_auth_routes.merge(authenticated_routes)
+    rate_limited_auth_routes
+        .merge(device_poll_routes)
+        .merge(authenticated_routes)
 }
 
 // Service error conversions will be added as needed
@@ -3749,6 +3761,67 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "the 11th request in the window should have been rate limited"
         );
+    }
+
+    /// `/auth/cli/device/poll` must not share the brute-force limiter: a CLI
+    /// polling at the advertised interval makes 30 requests a minute, and the
+    /// shared 10-per-minute budget used to reject the 11th poll with a 429
+    /// before the user could approve. Drives the real router: a full poll
+    /// budget is admitted, leaves the login budget untouched, and the first
+    /// poll over budget gets RFC 8628 `slow_down` (200), not 429.
+    #[tokio::test]
+    async fn test_device_poll_route_has_its_own_limiter_that_answers_slow_down() {
+        use tower::ServiceExt;
+
+        let app = super::configure_routes().with_state(admin_owner_state());
+        let peer: std::net::SocketAddr = "203.0.113.2:12345".parse().unwrap();
+        // `{}` has no `device_code`, so an admitted poll is rejected by the
+        // JSON extractor (422) before the handler touches the database.
+        let send = |app: axum::Router, uri: &'static str| async move {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, body)
+        };
+
+        let budget = crate::cli_device_handler::device_poll_rate_limit_config().max_requests;
+        for i in 0..budget {
+            let (status, _) = send(app.clone(), "/auth/cli/device/poll").await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "poll {i} (within the poll budget of {budget}) was not admitted"
+            );
+        }
+
+        for i in 0..10 {
+            let (status, _) = send(app.clone(), "/auth/login").await;
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "login {i} was rate limited; polls must not consume the login budget"
+            );
+        }
+
+        let (status, body) = send(app.clone(), "/auth/cli/device/poll").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an over-budget poll must not be a 429"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body, serde_json::json!({ "status": "slow_down" }));
     }
 
     /// The login handler must return a constant 401 detail for both
