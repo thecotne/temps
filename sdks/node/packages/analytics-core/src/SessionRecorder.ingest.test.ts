@@ -295,3 +295,109 @@ describe("buffer bound", () => {
     expect(recorder.getDroppedEventCount()).toBe(15);
   });
 });
+
+/** Requests to the init endpoint, in order. */
+function initPosts(): unknown[] {
+  return fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/session-replay/init"));
+}
+
+/** Console output the recorder produced, by method. */
+function spyOnConsole(): Record<"log" | "info" | "debug" | "warn" | "error", ReturnType<typeof vi.spyOn>> {
+  return {
+    log: vi.spyOn(console, "log").mockImplementation(() => {}),
+    info: vi.spyOn(console, "info").mockImplementation(() => {}),
+    debug: vi.spyOn(console, "debug").mockImplementation(() => {}),
+    warn: vi.spyOn(console, "warn").mockImplementation(() => {}),
+    error: vi.spyOn(console, "error").mockImplementation(() => {}),
+  };
+}
+
+describe("session init status", () => {
+  it("treats a 200 from /init as success, like the 201 the endpoint sends", async () => {
+    // A same-origin proxy can relay the endpoint's 201 as a 200. The session
+    // exists on the server either way, so rejecting it strands that session
+    // and every retry strands another.
+    fetchMock.mockResolvedValue({ status: 200, ok: true });
+
+    const recorder = newRecorder({ enabled: true });
+    await vi.waitFor(() => expect(recordCalls).toHaveLength(1));
+
+    expect(initPosts()).toHaveLength(1);
+    expect(recorder.getSessionId()).not.toBeNull();
+  });
+});
+
+describe("console output", () => {
+  it("logs nothing while recording and uploading succeed", async () => {
+    const consoleSpies = spyOnConsole();
+    const { emit } = await startedRecorder({ batchSize: 2 });
+
+    emit(mkEvent(1));
+    emit(mkEvent(2));
+    await vi.waitFor(() => expect(eventPosts()).toHaveLength(1));
+
+    for (const spy of Object.values(consoleSpies)) expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("warns once, not on every retry, when event uploads keep failing", async () => {
+    const consoleSpies = spyOnConsole();
+    const { emit } = await startedRecorder({ batchSize: 2, flushInterval: 500 });
+
+    fetchMock.mockRejectedValue(new TypeError("Failed to fetch"));
+    emit(mkEvent(1));
+    emit(mkEvent(2));
+    // Backoff doubles from 2s; 20s covers three attempts.
+    await vi.advanceTimersByTimeAsync(20000);
+
+    expect(eventPosts().length).toBeGreaterThanOrEqual(3);
+    expect(consoleSpies.warn).toHaveBeenCalledTimes(1);
+    expect(consoleSpies.warn.mock.calls[0][0]).toContain("[SessionRecorder] event upload failed");
+    expect(consoleSpies.error).not.toHaveBeenCalled();
+  });
+
+  it("warns once when /init is rejected instead of failing silently", async () => {
+    const consoleSpies = spyOnConsole();
+    fetchMock.mockResolvedValue({ status: 401, ok: false });
+
+    const recorder = newRecorder({ enabled: false });
+    const internal = recorder as unknown as { enabled: boolean; startRecording(): Promise<void> };
+    internal.enabled = true;
+    // Each start retries init until the retry ceiling.
+    for (let i = 0; i < 4; i++) await internal.startRecording();
+
+    expect(initPosts()).toHaveLength(3);
+    expect(consoleSpies.warn).toHaveBeenCalledTimes(1);
+    expect(consoleSpies.warn.mock.calls[0][0]).toContain("session init failed: HTTP 401");
+    expect(consoleSpies.error).not.toHaveBeenCalled();
+  });
+
+  it("with debug, reports session start and every failed upload", async () => {
+    const consoleSpies = spyOnConsole();
+    const { emit } = await startedRecorder({ batchSize: 2, flushInterval: 500, debug: true });
+
+    expect(consoleSpies.info.mock.calls.map(([message]) => String(message))).toContainEqual(
+      expect.stringMatching(/^\[SessionRecorder\] session .+ initialized$/),
+    );
+
+    fetchMock.mockRejectedValue(new TypeError("Failed to fetch"));
+    emit(mkEvent(1));
+    emit(mkEvent(2));
+    await vi.advanceTimersByTimeAsync(20000);
+
+    expect(consoleSpies.warn.mock.calls.length).toBe(eventPosts().length);
+    expect(consoleSpies.warn.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("with debug, says why a page is not recorded", () => {
+    const consoleSpies = spyOnConsole();
+    window.history.pushState({}, "", "/login");
+    try {
+      newRecorder({ enabled: true, debug: true });
+    } finally {
+      window.history.pushState({}, "", "/");
+    }
+
+    expect(consoleSpies.info).toHaveBeenCalledWith("[SessionRecorder] not recording /login: excluded path");
+    expect(initPosts()).toHaveLength(0);
+  });
+});

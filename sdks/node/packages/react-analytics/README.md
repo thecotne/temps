@@ -91,6 +91,7 @@ export default function App({ children }) {
   enableSessionRecording={false}    // Off by default
   sessionRecordingConfig={{
     excludedPaths: ['/settings/*', '/admin/*'],
+    useDefaultExcludedPaths: true,  // Also skip login/checkout/payment/etc. (default)
     sessionSampleRate: 1.0,         // Record 100% of sessions (default)
     maskAllInputs: true,            // Mask all input fields (default)
     maskTextSelector: '[data-mask]', // CSS selector for text masking
@@ -98,9 +99,15 @@ export default function App({ children }) {
     ignoreClass: 'rr-ignore',       // CSS class to ignore
     maskTextClass: 'rr-mask',       // CSS class to mask text
     recordCanvas: false,            // Record canvas elements (default: false)
-    collectFonts: false,            // Collect font data (default: false)
+    collectFonts: true,             // Capture FontFace fonts (default: true)
     batchSize: 100,                 // Events per batch (default)
-    flushInterval: 5000,            // Flush interval in ms (default)
+    flushInterval: 10000,           // Flush interval in ms (default)
+    idleTimeout: 60000,             // Pause after 60s without interaction (default; 0 = never)
+    pauseOnHidden: true,            // Pause while the tab is hidden (default)
+    checkoutEveryNms: 30000,        // Full snapshot every 30s (default)
+    checkoutEveryNth: 200,          // ...or every 200 events (default)
+    maxBufferedEvents: 5000,        // Buffer cap while ingest is unreachable (default)
+    debug: false,                   // Log recorder diagnostics to the console (default: false)
   }}
 >
   {children}
@@ -405,19 +412,34 @@ sessionRecordingConfig={{
 
 ### Path Exclusions
 
-Exclude specific routes from recording:
+Common authentication and payment routes (`/login`, `/signup`, `/checkout*`,
+`/payment*`, `/billing*`, `/reset-password*`, `/mfa*`, …) are never recorded:
+they are merged into `excludedPaths` by default. Set
+`useDefaultExcludedPaths: false` to record them.
+
+Exclude additional routes:
 
 ```tsx
 sessionRecordingConfig={{
   excludedPaths: [
     '/settings/*',    // Wildcard: all settings subpages
     '/admin/*',       // Wildcard: entire admin area
-    '/checkout',      // Exact match
+    '/account',       // Exact match
   ],
 }}
 ```
 
 Recording automatically pauses when navigating to excluded paths and resumes when leaving them.
+
+### Debugging
+
+The recorder stays silent in visitors' consoles: apart from a single warning
+for the first failed session init and the first failed upload, it logs nothing.
+To see why a page is or isn't recorded, set `debug: true`:
+
+```tsx
+sessionRecordingConfig={{ debug: true }}
+```
 
 ### How It Works
 

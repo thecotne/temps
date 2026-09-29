@@ -11,6 +11,10 @@ describe("TempsAnalyticsProvider", () => {
   beforeEach(() => {
     vi.clearAllMocks();
 
+    // Real storage answers null for a missing key; the shared mock answers
+    // undefined, which the recording toggle reads as a stored "disabled".
+    vi.mocked(window.localStorage.getItem).mockReturnValue(null);
+
     // Mock crypto.randomUUID for SessionRecorder
     Object.defineProperty(global, 'crypto', {
       value: {
@@ -234,6 +238,47 @@ describe("TempsAnalyticsProvider", () => {
       );
       expect(sessionInitCalls.length).toBeGreaterThan(0);
     }, { timeout: 3000 });
+  });
+
+  describe("default excluded paths", () => {
+    function sessionInitCalls(fetchSpy: ReturnType<typeof vi.spyOn>): unknown[] {
+      return fetchSpy.mock.calls.filter((call: unknown[]) =>
+        String(call[0]).includes("session-replay/init"),
+      );
+    }
+
+    beforeEach(() => {
+      window.location = { ...window.location, pathname: "/login", href: "https://example.com/login" };
+    });
+
+    it("does not record a built-in sensitive path through the provider", async () => {
+      const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValue(new Response(null, { status: 201 }));
+
+      render(
+        <TempsAnalyticsProvider enableSessionRecording={true} autoTrackPageviews={false}>
+          <div>Test</div>
+        </TempsAnalyticsProvider>
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(sessionInitCalls(fetchSpy)).toHaveLength(0);
+    });
+
+    it("records it when useDefaultExcludedPaths is false", async () => {
+      const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValue(new Response(null, { status: 201 }));
+
+      render(
+        <TempsAnalyticsProvider
+          enableSessionRecording={true}
+          autoTrackPageviews={false}
+          sessionRecordingConfig={{ useDefaultExcludedPaths: false }}
+        >
+          <div>Test</div>
+        </TempsAnalyticsProvider>
+      );
+
+      await waitFor(() => expect(sessionInitCalls(fetchSpy)).toHaveLength(1));
+    });
   });
 
   it("should not initialize session recording when disabled", () => {

@@ -383,19 +383,25 @@ Pass to the provider as `sessionRecordingConfig`:
     CSS class to mask text content.
   </Property>
   <Property name="excludedPaths" type="string[]">
-    URL paths to exclude from recording. Supports wildcards (e.g. `/admin/*`).
+    URL paths to exclude from recording. Supports wildcards (e.g. `/admin/*`). Merged with the built-in sensitive paths (login, signup, checkout, payment, billing, password reset, MFA, verification) unless `useDefaultExcludedPaths` is `false`.
+  </Property>
+  <Property name="useDefaultExcludedPaths" type="boolean" defaultValue="true">
+    Also exclude the built-in sensitive paths. Set to `false` to record everything except `excludedPaths`.
   </Property>
   <Property name="recordCanvas" type="boolean" defaultValue="false">
     Record canvas element content.
   </Property>
-  <Property name="collectFonts" type="boolean" defaultValue="false">
-    Collect font data for accurate replay.
+  <Property name="collectFonts" type="boolean" defaultValue="true">
+    Capture fonts loaded through the `FontFace` API so replays render with the page's typography.
   </Property>
   <Property name="batchSize" type="number" defaultValue="100">
     Number of events per batch before sending.
   </Property>
-  <Property name="flushInterval" type="number" defaultValue="5000">
+  <Property name="flushInterval" type="number" defaultValue="10000">
     Maximum time (ms) before flushing a batch.
+  </Property>
+  <Property name="debug" type="boolean" defaultValue="false">
+    Log recorder diagnostics (session start, skipped pages, every failed request) to the console. When off, only the first failed init and the first failed upload are reported.
   </Property>
 </Properties>
 
