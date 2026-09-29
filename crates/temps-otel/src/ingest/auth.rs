@@ -205,6 +205,13 @@ impl OtelAuthService {
         let _ = self.project_access_checker.set(checker);
     }
 
+    /// Whether a project access checker has been injected. Lets plugin tests
+    /// assert the wiring without reaching the database.
+    #[cfg(test)]
+    pub(crate) fn has_project_access_checker(&self) -> bool {
+        self.project_access_checker.get().is_some()
+    }
+
     /// Authenticate any ingest token — project (`tk_`/`dt_`) or service (`si_`).
     ///
     /// Routes `si_` tokens to `authenticate_service_token`; all others fall

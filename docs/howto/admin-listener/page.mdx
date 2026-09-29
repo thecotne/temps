@@ -57,19 +57,31 @@ The admin gate (CIDR + Host allowlists) is layered on top of the admin listener 
 | `temps-analytics-events`        | `POST /api/_temps/event`                                                               | Browser SDK on customer site |
 | `temps-analytics-session-replay`| `POST /api/_temps/session-replay/init`, `POST /api/_temps/session-replay/events`       | Browser SDK                  |
 | `temps-analytics-performance`   | `POST /api/_temps/speed`, `POST /api/_temps/speed/update`                              | Browser SDK                  |
-| `temps-error-tracking`          | Sentry/OTLP ingest, sentry-cli release/source-map upload                               | App SDKs + CI/CD             |
+| `temps-error-tracking`          | Sentry event/envelope ingest, sentry-cli release/source-map upload                     | App SDKs + CI/CD             |
+| `temps-otel`                    | `POST /api/otel/v1/{traces,metrics,logs}`, `POST /api/otel/v1/{project_id}/{environment_id}/{deployment_id}/{traces,metrics,logs}` | OpenTelemetry SDKs and collectors |
 | `temps-email-tracking`          | `GET /api/t/pixel/...`, `GET /api/t/click/...`, `POST /api/t/webhook/ses`              | Recipient browsers + AWS SES |
 | `temps-revenue`, `temps-email`  | Stripe + email provider webhooks                                                       | External services            |
 | Multi-node                      | `POST /api/internal/nodes/register`, `POST /api/internal/nodes/{id}/heartbeat`, route sync | Worker nodes                 |
 
 ### Admin surface
 
-Everything else — `/api/auth/*`, `/api/projects/...`, settings, deployments, alert rules, error-group queries, source-map management, the AI gateway, AI gateway usage analytics, the dashboard SPA, Swagger UI at `/swagger-ui`.
+Everything else — `/api/auth/*`, `/api/projects/...`, settings, deployments, alert rules, error-group queries, source-map management, OpenTelemetry trace/metric/log queries, dashboards and metric alerts (every `/api/otel/*` route outside `/api/otel/v1/*`), the AI gateway, AI gateway usage analytics, the dashboard SPA, Swagger UI at `/swagger-ui`.
 
 <Note>
   **Webhooks are public on purpose.** GitHub, Stripe, and AWS SES must reach
   webhook endpoints from arbitrary IPs. Each webhook handler verifies its own
   signature, so the public listener doesn't weaken the security model.
+</Note>
+
+<Note>
+  **OTLP ingest is public; the OpenTelemetry read API is not.** Every OTLP
+  request authenticates itself with an `Authorization: Bearer` or
+  `X-Temps-Api-Key` header (API key, deployment token or service ingest key),
+  and is size-capped, rate-limited and, for project telemetry, checked against
+  the storage quota before its payload is decoded. The Temps proxy forwards `/api/otel` to the public listener, which
+  is also where the `OTEL_EXPORTER_OTLP_ENDPOINT` injected into deployments
+  lands. If you split listeners, point any exporter you configured by hand at
+  the public address: the admin listener does not serve `/api/otel/v1/*`.
 </Note>
 
 <Note>
@@ -178,6 +190,11 @@ Then verify the split:
 curl -i http://127.0.0.1:8080/api/_temps/event \
   -H 'content-type: application/json' -d '{}'
 # → 400 (validation) or 204. Important: NOT 404.
+
+# Public listener: OTLP ingest is routed (rejected here only for the missing token)
+curl -i -X POST http://127.0.0.1:8080/api/otel/v1/traces \
+  -H 'content-type: application/x-protobuf'
+# → 401. Important: NOT 404.
 
 # Public listener: admin endpoints 404
 curl -i http://127.0.0.1:8080/api/auth/login

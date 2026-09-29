@@ -842,9 +842,10 @@ impl TempsPlugin for OtelPlugin {
             };
             context.register_service(storage.clone());
 
-            // Create auth service. Also registered in the context so
-            // `configure_routes` can inject the ADR-028 ProjectAccessChecker
-            // (registered by a later plugin) into the `tk_`-key ingest path.
+            // Create auth service. Also registered in the context so the
+            // route hooks (`route_state`) can inject the ADR-028
+            // ProjectAccessChecker (registered by a later plugin) into the
+            // `tk_`-key ingest path.
             let auth_service = Arc::new(OtelAuthService::new(db.clone()));
             context.register_service(auth_service.clone());
 
@@ -1102,7 +1103,8 @@ impl TempsPlugin for OtelPlugin {
             );
 
             // Create app state for handlers. The `project_access_checker` is
-            // injected in `configure_routes` (after all services register).
+            // injected by the route hooks (`route_state`), after all services
+            // register.
             let app_state = OtelAppState {
                 otel_service: otel_service.clone(),
                 metrics_store: Some(metrics_store.clone()),
@@ -1726,28 +1728,56 @@ impl TempsPlugin for OtelPlugin {
         })
     }
 
+    /// Admin listener: OTel queries, dashboards, alert rules, facets and Cloud
+    /// telemetry controls. OTLP ingest is not here; see
+    /// [`Self::configure_public_routes`].
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let app_state_arc = context.require_service::<OtelAppState>();
-        let mut app_state: OtelAppState = app_state_arc.as_ref().clone();
-        app_state.project_access_checker =
-            context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let router = handlers::configure_routes().with_state(route_state(context));
+        Some(PluginRoutes::new(router))
+    }
 
-        // Same checker feeds the `tk_`-key ingest auth path, so team-based
-        // project access is enforced on writes exactly as on reads.
-        if let Some(checker) = app_state.project_access_checker.clone() {
-            context
-                .require_service::<OtelAuthService>()
-                .set_project_access_checker(checker);
-        }
-
-        let router = handlers::configure_routes().with_state(app_state);
-
+    /// Public listener: OTLP/HTTP ingest (`POST /otel/v1/...`).
+    ///
+    /// OTLP exporters are SDK ingest clients, like the Sentry envelope
+    /// endpoint, and the proxy forwards `/api/otel` to the public listener. In
+    /// two-listener mode (`TEMPS_CONSOLE_ADMIN_ADDRESS` set) ingest therefore
+    /// has to be registered here, or every exporter sent through the proxy gets
+    /// a 404. The handlers do not rely on the admin auth middleware: each one
+    /// authenticates its own token and applies the rate limit, storage quota
+    /// and body limit before decoding anything.
+    ///
+    /// The routes are registered here only, not also in `configure_routes`:
+    /// single-listener mode merges both routers into one, and Axum panics on a
+    /// duplicate method and path.
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let router = handlers::configure_public_routes().with_state(route_state(context));
         Some(PluginRoutes::new(router))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
         Some(<OtelApiDoc as OpenApiTrait>::openapi())
     }
+}
+
+/// Build the handler state shared by the admin and public OTel routers.
+///
+/// Also wires the optional ADR-028 `ProjectAccessChecker` into the `tk_`-key
+/// ingest auth path, so team-based project access is enforced on writes
+/// exactly as on reads. Both route hooks call this: ingest is served from the
+/// public router, so the checker must not depend on `configure_routes` having
+/// run first. Setting it is idempotent (first registration wins).
+fn route_state(context: &PluginContext) -> OtelAppState {
+    let mut app_state: OtelAppState = context.require_service::<OtelAppState>().as_ref().clone();
+    app_state.project_access_checker =
+        context.get_service::<dyn temps_core::ProjectAccessChecker>();
+
+    if let Some(checker) = app_state.project_access_checker.clone() {
+        context
+            .require_service::<OtelAuthService>()
+            .set_project_access_checker(checker);
+    }
+
+    app_state
 }
 
 /// The Cloud-primary telemetry outbox's byte cap, from the singleton `settings`
@@ -2087,5 +2117,207 @@ mod tests {
         let plugin = OtelPlugin::new();
         let schema = plugin.openapi_schema();
         assert!(schema.is_some());
+    }
+
+    // ── Listener placement of routes ────────────────────────────────────
+
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use http_body_util::BodyExt;
+    use temps_core::plugin::PluginManager;
+    use tower::ServiceExt;
+
+    /// Every OTLP ingest route, as registered inside the listener routers
+    /// (without the `/api` prefix the console applies when mounting them).
+    const OTLP_INGEST_PATHS: [&str; 6] = [
+        "/otel/v1/traces",
+        "/otel/v1/metrics",
+        "/otel/v1/logs",
+        "/otel/v1/1/2/3/traces",
+        "/otel/v1/1/2/3/metrics",
+        "/otel/v1/1/2/3/logs",
+    ];
+
+    /// A sample of the OTel read API. None of these may be reachable on the
+    /// public listener.
+    const OTEL_QUERY_PATHS: [&str; 9] = [
+        "/otel/traces",
+        "/otel/trace-summaries",
+        "/otel/logs",
+        "/otel/metrics",
+        "/otel/global/trace-summaries",
+        "/otel/global/spans",
+        "/otel/pipeline-stats",
+        "/otel/dashboards",
+        "/otel/alerts",
+    ];
+
+    /// Allows every project; only its presence matters to these tests.
+    struct AllowAllChecker;
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for AllowAllChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(true)
+        }
+    }
+
+    /// A `PluginManager` holding only the OTel plugin, with the services its
+    /// route hooks read registered directly. (`register_services` itself needs
+    /// a database and every sibling plugin, and is not what is under test.)
+    fn manager_with_otel_routes(
+        checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    ) -> (PluginManager, Arc<OtelAuthService>) {
+        let auth_service = Arc::new(OtelAuthService::new(Arc::new(
+            sea_orm::DatabaseConnection::Disconnected,
+        )));
+        let mut manager = PluginManager::default();
+        manager.register_plugin(Box::new(OtelPlugin::new()));
+
+        let context = manager.service_context();
+        context.register_service(Arc::new(crate::test_support::router_test_app_state(
+            auth_service.clone(),
+        )));
+        context.register_service(auth_service.clone());
+        if let Some(checker) = checker {
+            context.register_service(checker);
+        }
+        (manager, auth_service)
+    }
+
+    /// Send one bodiless request with no credentials and return the response.
+    async fn send(router: axum::Router, method: Method, uri: &str) -> axum::response::Response {
+        router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds")
+    }
+
+    #[tokio::test]
+    async fn otlp_ingest_is_served_on_the_public_router() {
+        let (manager, _) = manager_with_otel_routes(None);
+        let split = manager
+            .build_split_application()
+            .expect("split application builds");
+
+        for path in OTLP_INGEST_PATHS {
+            let response = send(split.public.clone(), Method::POST, path).await;
+            // 401 from the handler's own token check, not 404 from a missing
+            // route: ingest is reachable on the public listener.
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "POST {path} on the public router"
+            );
+        }
+
+        // The 401 is the OTLP handler's own Problem Details response.
+        let response = send(split.public.clone(), Method::POST, "/otel/v1/traces").await;
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body collects")
+            .to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("Authentication Failed"),
+            "expected the ingest handler's auth failure, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn otel_query_routes_stay_off_the_public_router() {
+        let (manager, _) = manager_with_otel_routes(None);
+        let split = manager
+            .build_split_application()
+            .expect("split application builds");
+
+        for path in OTEL_QUERY_PATHS {
+            assert_eq!(
+                send(split.public.clone(), Method::GET, path).await.status(),
+                StatusCode::NOT_FOUND,
+                "GET {path} must not be served on the public router"
+            );
+            // Same path on the admin router reaches the handler, whose
+            // `RequireAuth` rejects the missing session: the 404 above is a
+            // genuinely absent route, not a typo in the path.
+            assert_eq!(
+                send(split.admin.clone(), Method::GET, path).await.status(),
+                StatusCode::UNAUTHORIZED,
+                "GET {path} on the admin router"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn otlp_ingest_is_registered_on_one_listener_only() {
+        let (manager, _) = manager_with_otel_routes(None);
+        let split = manager
+            .build_split_application()
+            .expect("split application builds");
+
+        for path in OTLP_INGEST_PATHS {
+            assert_eq!(
+                send(split.admin.clone(), Method::POST, path).await.status(),
+                StatusCode::NOT_FOUND,
+                "POST {path} must not also be registered on the admin router"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn single_listener_mode_serves_ingest_and_queries_from_one_router() {
+        let (manager, _) = manager_with_otel_routes(None);
+        // Merges the public and admin routers under `/api`, as single-listener
+        // mode does. A route registered on both would panic here.
+        let app = manager.build_application().expect("application builds");
+
+        assert_eq!(
+            send(app.clone(), Method::POST, "/api/otel/v1/traces")
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send(app, Method::GET, "/api/otel/traces").await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn public_route_hook_wires_the_project_access_checker() {
+        // Ingest is served from the public router, so `tk_`-key project access
+        // must be enforced even if the admin hook has not run.
+        let (manager, auth_service) = manager_with_otel_routes(Some(Arc::new(AllowAllChecker)));
+        assert!(!auth_service.has_project_access_checker());
+
+        let routes = OtelPlugin::new()
+            .configure_public_routes(&manager.service_context().create_plugin_context());
+
+        assert!(routes.is_some());
+        assert!(auth_service.has_project_access_checker());
+    }
+
+    #[test]
+    fn public_route_hook_without_checker_plugin_leaves_ingest_auth_unchanged() {
+        let (manager, auth_service) = manager_with_otel_routes(None);
+
+        let routes = OtelPlugin::new()
+            .configure_public_routes(&manager.service_context().create_plugin_context());
+
+        assert!(routes.is_some());
+        assert!(!auth_service.has_project_access_checker());
     }
 }

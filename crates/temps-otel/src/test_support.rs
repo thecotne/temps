@@ -1343,3 +1343,144 @@ pub fn find_roots(spans: &[SpanRecord]) -> Vec<&SpanRecord> {
         .filter(|s| s.parent_span_id.is_none())
         .collect()
 }
+
+// ── Router-level app state ──────────────────────────────────────────
+
+/// Audit logger that records nothing.
+struct NoOpAuditLogger;
+
+#[async_trait]
+impl temps_core::AuditLogger for NoOpAuditLogger {
+    async fn create_audit_log(
+        &self,
+        _operation: &dyn temps_core::AuditOperation,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Notification service that sends nothing. Only needed so the alarm services
+/// inside `MetricAlertEvaluator` can be constructed.
+struct NoOpNotificationService;
+
+#[async_trait]
+impl temps_core::notifications::NotificationService for NoOpNotificationService {
+    async fn send_email(
+        &self,
+        _message: temps_core::notifications::EmailMessage,
+    ) -> Result<(), temps_core::notifications::NotificationError> {
+        Ok(())
+    }
+
+    async fn send_notification(
+        &self,
+        _notification: temps_core::notifications::NotificationData,
+    ) -> Result<(), temps_core::notifications::NotificationError> {
+        Ok(())
+    }
+
+    async fn is_configured(&self) -> Result<bool, temps_core::notifications::NotificationError> {
+        Ok(false)
+    }
+}
+
+/// Job queue that drops every job, for the same reason as
+/// [`NoOpNotificationService`].
+struct NoOpJobQueue;
+
+#[async_trait]
+impl temps_core::JobQueue for NoOpJobQueue {
+    async fn send(&self, _job: temps_core::jobs::Job) -> Result<(), temps_core::jobs::QueueError> {
+        Ok(())
+    }
+
+    fn subscribe(&self) -> Box<dyn temps_core::jobs::JobReceiver> {
+        Box::new(NoOpJobReceiver)
+    }
+}
+
+struct NoOpJobReceiver;
+
+#[async_trait]
+impl temps_core::jobs::JobReceiver for NoOpJobReceiver {
+    async fn recv(&mut self) -> Result<temps_core::jobs::Job, temps_core::jobs::QueueError> {
+        Err(temps_core::jobs::QueueError::InvalidData(
+            "no-op receiver".to_string(),
+        ))
+    }
+}
+
+/// A complete [`crate::OtelAppState`] for router-level tests.
+///
+/// Every database-backed service sits on a disconnected connection and the
+/// span store is a [`MockOtelStorage`], so this is only suitable for requests
+/// that are answered before any storage or database access: routing (404 vs.
+/// a handler's own response), missing-credential rejection, extractor
+/// failures. `auth_service` is passed in so a test can register the same
+/// instance with a plugin context and observe what the plugin wires into it.
+pub fn router_test_app_state(
+    auth_service: Arc<crate::ingest::auth::OtelAuthService>,
+) -> crate::OtelAppState {
+    use crate::services;
+
+    let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
+    let storage: Arc<dyn OtelStorage> = Arc::new(MockOtelStorage::new());
+
+    let otel_service = Arc::new(services::OtelService::new(
+        storage.clone(),
+        auth_service,
+        Arc::new(crate::ingest::rate_limit::RateLimiter::new(
+            1000,
+            std::time::Duration::from_secs(60),
+        )),
+        services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
+    ));
+
+    let metric_alert_service = Arc::new(services::MetricAlertService::new(db.clone()));
+    let notify: Arc<dyn temps_core::notifications::NotificationService> =
+        Arc::new(NoOpNotificationService);
+    let queue: Arc<dyn temps_core::JobQueue> = Arc::new(NoOpJobQueue);
+    let metric_alert_evaluator = Arc::new(services::MetricAlertEvaluator::new(
+        metric_alert_service.clone(),
+        otel_service.clone(),
+        Arc::new(temps_monitoring::AlarmService::new(
+            db.clone(),
+            notify.clone(),
+            queue.clone(),
+        )),
+        Arc::new(temps_monitoring::AlarmService::new(
+            db.clone(),
+            notify,
+            queue,
+        )),
+        db.clone(),
+        None,
+    ));
+
+    let facet_cache: services::FacetCache =
+        Arc::new(arc_swap::ArcSwap::from_pointee(HashMap::new()));
+
+    crate::OtelAppState {
+        otel_service,
+        metrics_store: None,
+        metrics_write_tx: None,
+        facet_service: Arc::new(services::FacetService::new(db.clone(), None, facet_cache)),
+        dashboard_service: Arc::new(services::MetricDashboardService::new(db.clone())),
+        metric_alert_service,
+        metric_alert_evaluator,
+        audit_service: Arc::new(NoOpAuditLogger),
+        trace_hint_tx: None,
+        cross_project_service: Arc::new(services::CrossProjectTraceService::new(
+            db.clone(),
+            storage,
+        )),
+        otel_relay_tx: None,
+        project_access_checker: None,
+        cloud_backfill_progress: Arc::new(services::CloudBackfillProgressService::new(db.clone())),
+        telemetry_write_modes: Arc::new(services::TelemetryWriteModeService::new(db.clone())),
+        cloud_link: None,
+        bulk_activation: Arc::new(services::CloudBulkActivationService::new(db)),
+        cloud_backfill_source: None,
+        plan_signing_key: Arc::new([0u8; 32]),
+    }
+}
