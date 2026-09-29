@@ -352,8 +352,26 @@ describe("SessionRecorder", () => {
     // }
   });
 
-  it("should handle initialization failure gracefully", async () => {
-    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  /** Console calls the recorder itself made, across every console method. */
+  function recorderConsoleCalls(spies: Array<ReturnType<typeof vi.spyOn>>): unknown[][] {
+    return spies
+      .flatMap((spy) => spy.mock.calls as unknown[][])
+      .filter((args) => String(args[0]).startsWith("[SessionRecorder]"));
+  }
+
+  function spyOnConsole(): Record<"log" | "info" | "warn" | "error", ReturnType<typeof vi.spyOn>> {
+    return {
+      log: vi.spyOn(console, "log").mockImplementation(() => {}),
+      info: vi.spyOn(console, "info").mockImplementation(() => {}),
+      warn: vi.spyOn(console, "warn").mockImplementation(() => {}),
+      error: vi.spyOn(console, "error").mockImplementation(() => {}),
+    };
+  }
+
+  it("should warn once, without console.error, when initialization fails", async () => {
+    const consoleSpies = spyOnConsole();
+    // Drop "once" responses queued by earlier tests; they take precedence.
+    fetchSpy.mockReset();
     fetchSpy.mockRejectedValue(new Error("Network error"));
 
     render(
@@ -371,19 +389,22 @@ describe("SessionRecorder", () => {
       );
     });
 
-    expect(consoleSpy).toHaveBeenCalledWith(
-      expect.stringContaining("[SessionRecorder] Failed to initialize session: Error: Network error (attempt 1/3)")
+    await waitFor(() => expect(consoleSpies.warn).toHaveBeenCalledTimes(1));
+    expect(consoleSpies.warn).toHaveBeenCalledWith(
+      expect.stringContaining("[SessionRecorder] session init failed"),
+      expect.any(Error)
     );
+    expect(consoleSpies.error).not.toHaveBeenCalled();
+    expect(consoleSpies.log).not.toHaveBeenCalled();
 
-    consoleSpy.mockRestore();
+    Object.values(consoleSpies).forEach((spy) => spy.mockRestore());
   });
 
-  it("should stop retrying after 3 failed initialization attempts", async () => {
-    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("should stop retrying after 3 failed initialization attempts and warn only once", async () => {
+    const consoleSpies = spyOnConsole();
 
     // Mock all init attempts to fail
+    fetchSpy.mockReset();
     fetchSpy.mockRejectedValue(new Error("Network error"));
 
     const { rerender } = render(
@@ -394,14 +415,14 @@ describe("SessionRecorder", () => {
       />
     );
 
-    // Wait for first attempt
     await waitFor(() => {
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        "[SessionRecorder] Attempting to initialize session (attempt 1/3)"
+      expect(fetchSpy).toHaveBeenCalledWith(
+        `${DEFAULT_BASE_PATH}/session-replay/init`,
+        expect.any(Object)
       );
     });
 
-    // Force re-renders to trigger more attempts
+    // Re-renders with unchanged props must not drive further attempts.
     for (let i = 0; i < 5; i++) {
       rerender(
         <SessionRecorder
@@ -413,25 +434,54 @@ describe("SessionRecorder", () => {
       await new Promise(resolve => setTimeout(resolve, 100));
     }
 
-    // Should have attempted exactly 3 times
     const initCalls = fetchSpy.mock.calls.filter(
       call => (call[0] as string).includes("/session-replay/init")
     );
     expect(initCalls.length).toBeLessThanOrEqual(3);
+    expect(recorderConsoleCalls(Object.values(consoleSpies))).toHaveLength(1);
 
-    // Should have logged the exceeded retries message
-    expect(consoleSpy).toHaveBeenCalledWith(
-      "[SessionRecorder] Exceeded maximum initialization retries (3)"
+    Object.values(consoleSpies).forEach((spy) => spy.mockRestore());
+  });
+
+  it("logs nothing when init succeeds under StrictMode while a router touches history", async () => {
+    // Previously a second start that raced the in-flight init (a StrictMode
+    // remount, a re-render, or a router calling replaceState during startup)
+    // logged "Failed to initialize session" although the first init returned
+    // 201 and recording went ahead.
+    const consoleSpies = spyOnConsole();
+    let releaseInit: (response: Response) => void = () => {};
+    fetchSpy.mockReset();
+    fetchSpy.mockImplementation((input: unknown) => {
+      if (String(input).endsWith("/session-replay/init")) {
+        return new Promise<Response>((resolve) => { releaseInit = resolve; });
+      }
+      return Promise.resolve(new Response(null, { status: 200 }));
+    });
+
+    render(
+      <React.StrictMode>
+        <SessionRecorder
+          enabled={true}
+          basePath={DEFAULT_BASE_PATH}
+          domain="example.com"
+        />
+      </React.StrictMode>
     );
 
-    // Should show warning when trying to start after permanent failure
-    expect(consoleWarnSpy).toHaveBeenCalledWith(
-      "[SessionRecorder] Initialization has permanently failed, not retrying"
-    );
+    await waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledWith(
+        `${DEFAULT_BASE_PATH}/session-replay/init`,
+        expect.any(Object)
+      );
+    });
+    window.history.replaceState({}, "", "/test");
+    await new Promise(resolve => setTimeout(resolve, 150));
+    releaseInit(new Response(null, { status: 201 }));
+    await new Promise(resolve => setTimeout(resolve, 150));
 
-    consoleSpy.mockRestore();
-    consoleLogSpy.mockRestore();
-    consoleWarnSpy.mockRestore();
+    expect(recorderConsoleCalls(Object.values(consoleSpies))).toEqual([]);
+
+    Object.values(consoleSpies).forEach((spy) => spy.mockRestore());
   });
 
   it("should stop recording and flush events when unmounted", async () => {

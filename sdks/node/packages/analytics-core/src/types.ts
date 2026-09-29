@@ -72,6 +72,14 @@ export interface SessionRecordingConfig {
    * memory rather than growing until the tab dies. Defaults to 5000.
    */
   maxBufferedEvents?: number;
+  /**
+   * Log recorder diagnostics to the browser console: session start, why a page
+   * is not recorded (excluded path, sampled out), pauses, and every failed
+   * request. Defaults to false, in which case the recorder logs nothing except
+   * a single warning for the first failed session init and the first failed
+   * event upload.
+   */
+  debug?: boolean;
 }
 
 export interface AnalyticsClientOptions {
