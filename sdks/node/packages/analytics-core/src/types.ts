@@ -39,11 +39,17 @@ export interface SessionRecordingConfig {
   maskTextClass?: string;
   /** Record canvas elements. Defaults to false. */
   recordCanvas?: boolean;
-  /** Collect fonts. Defaults to false. */
+  /**
+   * Capture fonts loaded through the `FontFace` API so replays render with the
+   * page's own typography. Defaults to true.
+   */
   collectFonts?: boolean;
   /** Number of events to batch before sending. Defaults to 100. */
   batchSize?: number;
-  /** Interval in ms to flush events. Defaults to 5000. */
+  /**
+   * Interval in ms to flush events. Events are sent when either `batchSize` is
+   * reached or this interval elapses, whichever comes first. Defaults to 10000.
+   */
   flushInterval?: number;
   /**
    * Milliseconds of no user interaction after which recording pauses. A paused
