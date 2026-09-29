@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use super::super::types::ExceptionData;
 use super::*;
 use std::sync::Arc;
 use temps_database::test_utils::TestDatabase;
@@ -364,4 +365,299 @@ async fn test_normalize_error_message_groups_similar_errors() {
     assert_eq!(normalized2, normalized3);
     assert!(normalized1.contains("<num>"));
     assert!(normalized1.contains("<ip>"));
+}
+
+// ---------------------------------------------------------------------------
+// Vector-similarity grouping (pgvector `<=>` cosine distance)
+//
+// pgvector's `<=>` operator returns `double precision` (FLOAT8). These tests
+// run the real query against Postgres+pgvector so a mismatch between the SQL
+// type and the Rust type the row is decoded into surfaces as a test failure
+// instead of an HTTP 500 at ingest time.
+// ---------------------------------------------------------------------------
+
+/// Width of `error_groups.embedding` (`vector(384)`).
+const EMBEDDING_DIMS: usize = 384;
+
+/// Like `setup_test_db`, but returns `None` (so the test skips) when no
+/// container runtime is reachable. Migration/schema/image failures still panic.
+async fn try_setup_test_db() -> Option<TestDatabase> {
+    match TestDatabase::with_migrations().await {
+        Ok(test_db) => Some(test_db),
+        Err(error) if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) => {
+            println!("Docker not available, skipping: {error}");
+            None
+        }
+        Err(error) => panic!("Failed to create test database: {error}"),
+    }
+}
+
+/// Build a 384-wide embedding that is zero everywhere except at the listed
+/// `(index, value)` positions, so the cosine distance between two of them can
+/// be worked out by hand.
+fn sparse_embedding(entries: &[(usize, f32)]) -> error_groups::PgVector {
+    let mut values = vec![0.0_f32; EMBEDDING_DIMS];
+    for &(index, value) in entries {
+        values[index] = value;
+    }
+    error_groups::PgVector(values)
+}
+
+/// Insert an `error_groups` row carrying an explicit embedding and status.
+async fn insert_group_with_embedding(
+    db: &Arc<DatabaseConnection>,
+    project_id: i32,
+    status: &str,
+    embedding: error_groups::PgVector,
+) -> i32 {
+    let now = chrono::Utc::now();
+    error_groups::ActiveModel {
+        title: Set("TypeError: fixture".to_string()),
+        error_type: Set("TypeError".to_string()),
+        message_template: Set(Some("fixture".to_string())),
+        embedding: Set(Some(embedding)),
+        first_seen: Set(now),
+        last_seen: Set(now),
+        total_count: Set(1),
+        status: Set(status.to_string()),
+        assigned_to: Set(None),
+        project_id: Set(project_id),
+        environment_id: Set(None),
+        deployment_id: Set(None),
+        visitor_id: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await
+    .expect("Failed to insert error group")
+    .id
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_find_similar_group_by_embedding_decodes_distance_of_matching_row() {
+    let Some(test_db) = try_setup_test_db().await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let service = ErrorIngestionService::new(db.clone());
+    let project_id = create_test_project(&db).await;
+
+    let group_id =
+        insert_group_with_embedding(&db, project_id, "unresolved", sparse_embedding(&[(0, 1.0)]))
+            .await;
+
+    // Cosine distance to the stored group is ~0.005, well inside the threshold,
+    // so the query returns a row and its `distance` column must decode.
+    let found = service
+        .find_similar_group_by_embedding(&sparse_embedding(&[(0, 1.0), (1, 0.1)]), project_id)
+        .await
+        .expect("a matching row must decode instead of failing on the distance column");
+
+    assert_eq!(found, Some(group_id));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_find_similar_group_by_embedding_returns_nearest_group() {
+    let Some(test_db) = try_setup_test_db().await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let service = ErrorIngestionService::new(db.clone());
+    let project_id = create_test_project(&db).await;
+
+    // Both are inside the threshold; the farther one is inserted first so the
+    // result cannot be explained by insertion order.
+    let _farther = insert_group_with_embedding(
+        &db,
+        project_id,
+        "unresolved",
+        sparse_embedding(&[(0, 1.0), (1, 0.4)]),
+    )
+    .await;
+    let nearer = insert_group_with_embedding(
+        &db,
+        project_id,
+        "unresolved",
+        sparse_embedding(&[(0, 1.0), (1, 0.1)]),
+    )
+    .await;
+
+    let found = service
+        .find_similar_group_by_embedding(&sparse_embedding(&[(0, 1.0), (1, 0.1)]), project_id)
+        .await
+        .expect("query must succeed");
+
+    assert_eq!(found, Some(nearer));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_find_similar_group_by_embedding_respects_distance_threshold() {
+    let Some(test_db) = try_setup_test_db().await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let service = ErrorIngestionService::new(db.clone());
+    let query = sparse_embedding(&[(0, 1.0)]);
+
+    // Orthogonal vector: cosine distance 1.0, far outside the 0.15 threshold.
+    let orthogonal_project = create_test_project(&db).await;
+    insert_group_with_embedding(
+        &db,
+        orthogonal_project,
+        "unresolved",
+        sparse_embedding(&[(7, 1.0)]),
+    )
+    .await;
+    assert_eq!(
+        service
+            .find_similar_group_by_embedding(&query, orthogonal_project)
+            .await
+            .expect("query must succeed"),
+        None
+    );
+
+    // (1.0, 0.65) is ~0.162 from (1.0, 0.0): just over the threshold.
+    let just_over_project = create_test_project(&db).await;
+    insert_group_with_embedding(
+        &db,
+        just_over_project,
+        "unresolved",
+        sparse_embedding(&[(0, 1.0), (1, 0.65)]),
+    )
+    .await;
+    assert_eq!(
+        service
+            .find_similar_group_by_embedding(&query, just_over_project)
+            .await
+            .expect("query must succeed"),
+        None
+    );
+
+    // (1.0, 0.55) is ~0.124 from (1.0, 0.0): just under the threshold.
+    let just_under_project = create_test_project(&db).await;
+    let just_under_group = insert_group_with_embedding(
+        &db,
+        just_under_project,
+        "unresolved",
+        sparse_embedding(&[(0, 1.0), (1, 0.55)]),
+    )
+    .await;
+    assert_eq!(
+        service
+            .find_similar_group_by_embedding(&query, just_under_project)
+            .await
+            .expect("query must succeed"),
+        Some(just_under_group)
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_find_similar_group_by_embedding_filters_by_status_and_project() {
+    let Some(test_db) = try_setup_test_db().await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let service = ErrorIngestionService::new(db.clone());
+    let project_id = create_test_project(&db).await;
+    let other_project_id = create_test_project(&db).await;
+    let embedding = sparse_embedding(&[(0, 1.0)]);
+
+    // Identical embeddings, but resolved/ignored groups and other projects'
+    // groups must never be returned.
+    insert_group_with_embedding(&db, project_id, "resolved", embedding.clone()).await;
+    insert_group_with_embedding(&db, project_id, "ignored", embedding.clone()).await;
+    insert_group_with_embedding(&db, other_project_id, "unresolved", embedding.clone()).await;
+    assert_eq!(
+        service
+            .find_similar_group_by_embedding(&embedding, project_id)
+            .await
+            .expect("query must succeed"),
+        None
+    );
+
+    // An assigned group is still eligible.
+    let assigned =
+        insert_group_with_embedding(&db, project_id, "assigned", embedding.clone()).await;
+    assert_eq!(
+        service
+            .find_similar_group_by_embedding(&embedding, project_id)
+            .await
+            .expect("query must succeed"),
+        Some(assigned)
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_process_error_event_groups_similar_but_not_identical_errors() {
+    let Some(test_db) = try_setup_test_db().await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    let service = ErrorIngestionService::new(db.clone());
+    let project_id = create_test_project(&db).await;
+
+    // Populate `exceptions`, as the Sentry ingest path does, so the text that is
+    // embedded for the lookup matches the text stored on the created group.
+    let error_with_message = |message: &str| CreateErrorEventData {
+        exceptions: vec![ExceptionData {
+            exception_type: "TypeError".to_string(),
+            exception_value: Some(message.to_string()),
+            stack_trace: create_test_error_data(project_id).stack_trace,
+            mechanism: None,
+            module: None,
+            thread_id: None,
+        }],
+        ..create_test_error_data(project_id)
+    };
+
+    // Same message except for one short number: the fingerprint differs (the
+    // normalizer only masks numbers of 4+ digits) but the embeddings are
+    // nearly identical, so the second event must take the similarity path.
+    let first = error_with_message("Failed to load item 42 from the upstream inventory service");
+    let second = error_with_message("Failed to load item 43 from the upstream inventory service");
+    assert_ne!(
+        service.generate_fingerprint(&first),
+        service.generate_fingerprint(&second),
+        "fixture must miss the exact-fingerprint fast path"
+    );
+
+    let first_group = service
+        .process_error_event(first)
+        .await
+        .expect("first error must be ingested");
+    let second_group = service
+        .process_error_event(second)
+        .await
+        .expect("a similar-but-not-identical error must be ingested, not fail with a decode error");
+
+    assert_eq!(first_group, second_group);
+
+    let group = error_groups::Entity::find_by_id(first_group)
+        .one(db.as_ref())
+        .await
+        .expect("Failed to fetch group")
+        .expect("Group not found");
+    assert_eq!(group.total_count, 2);
+
+    let events = error_events::Entity::find()
+        .filter(error_events::Column::ErrorGroupId.eq(first_group))
+        .all(db.as_ref())
+        .await
+        .expect("Failed to fetch events");
+    assert_eq!(events.len(), 2);
+
+    // A genuinely different error still opens its own group.
+    let unrelated = error_with_message("Connection refused while opening the payment gateway socket");
+    let unrelated_group = service
+        .process_error_event(unrelated)
+        .await
+        .expect("unrelated error must be ingested");
+    assert_ne!(unrelated_group, first_group);
 }
