@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::geoip_service::{GeoIpService, GeoLocation};
+use crate::geoip_service::{GeoIpError, GeoIpService, GeoLocation};
 use crate::settings_service::GeoSettingsService;
 use chrono::Utc;
 use moka::future::Cache;
@@ -145,23 +145,19 @@ impl IpAddressService {
             return Ok(info);
         }
 
-        let geo_data =
-            match self
-                .geoip_service
-                .geolocate(ip_address_str.parse::<std::net::IpAddr>().map_err(|e| {
-                    anyhow::anyhow!("Invalid IP address '{}': {}", ip_address_str, e)
-                })?)
-                .await
-            {
-                Ok(data) => Some(data),
-                Err(e) => {
-                    error!(
-                        "Failed to get geolocation data for IP {}: {}",
-                        ip_address_str, e
-                    );
-                    None
-                }
-            };
+        let ip = ip_address_str
+            .parse::<std::net::IpAddr>()
+            .map_err(|e| anyhow::anyhow!("Invalid IP address '{}': {}", ip_address_str, e))?;
+
+        // A failed lookup never fails the caller: the row is stored without
+        // location data (empty country) so the IP still gets an id to link to.
+        let geo_data = match self.geoip_service.geolocate(ip).await {
+            Ok(data) => Some(data),
+            Err(e) => {
+                log_unresolved_geolocation(ip_address_str, &e);
+                None
+            }
+        };
 
         let new_ip = ip_geolocations::ActiveModel {
             ip_address: Set(ip_address_str.to_string()),
@@ -342,6 +338,42 @@ impl IpAddressService {
     }
 }
 
+/// Record why no geolocation was resolved for `ip_address`, at the severity
+/// the cause deserves.
+///
+/// Two outcomes are normal and must not read as failures in the server log:
+/// a non-global address (a container on a bridge network, a loopback hop, CGNAT)
+/// has no public location, and a global address can simply be absent from the
+/// GeoIP database. Neither is actionable per address, and each would otherwise
+/// add an ERROR for a healthy request. Anything else -- an unreadable or
+/// corrupt database -- is a real fault and stays at ERROR.
+fn log_unresolved_geolocation(ip_address: &str, error: &GeoIpError) {
+    match error {
+        GeoIpError::NonGlobalAddress(_) => {
+            debug!(
+                ip_address = ip_address,
+                "skipped the geolocation lookup for a non-global IP address; storing it without \
+                 location data"
+            );
+        }
+        GeoIpError::NotFound(reason) => {
+            debug!(
+                ip_address = ip_address,
+                reason = %reason,
+                "IP address has no entry in the geolocation database; storing it without \
+                 location data"
+            );
+        }
+        _ => {
+            error!(
+                ip_address = ip_address,
+                error = %error,
+                "Failed to get geolocation data for IP address"
+            );
+        }
+    }
+}
+
 /// Write `resolved` onto `active`, stamping `now` as the verification time.
 fn apply_geolocation(
     active: &mut ip_geolocations::ActiveModel,
@@ -382,6 +414,54 @@ fn geolocation_differs(stored: &ip_geolocations::Model, resolved: &GeoLocation) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use tracing::field::{Field, Visit};
+    use tracing::{span, Event, Level, Metadata, Subscriber};
+
+    /// Records the level and message of every event this crate emits on the
+    /// current thread, so a test can assert on the severity of what reached the
+    /// log rather than on the code that chose it.
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<Mutex<Vec<(Level, String)>>>);
+
+    struct MessageOf(String);
+
+    impl Visit for MessageOf {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl Subscriber for CapturedEvents {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            if !event.metadata().target().starts_with("temps_geo") {
+                return;
+            }
+            let mut message = MessageOf(String::new());
+            event.record(&mut message);
+            if let Ok(mut events) = self.0.lock() {
+                events.push((*event.metadata().level(), message.0));
+            }
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    impl CapturedEvents {
+        fn snapshot(&self) -> Vec<(Level, String)> {
+            self.0.lock().expect("captured events lock").clone()
+        }
+    }
 
     fn stored_row(now: UtcDateTime) -> ip_geolocations::Model {
         ip_geolocations::Model {
@@ -586,6 +666,121 @@ mod tests {
         assert_eq!(
             service.stale_lookup_days().await,
             i64::from(temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS)
+        );
+    }
+
+    /// A client on a private network is not a fault: the lookup is skipped and
+    /// nothing is logged above DEBUG.
+    #[test]
+    fn a_non_global_address_is_logged_below_error() {
+        let captured = CapturedEvents::default();
+        let _guard = tracing::subscriber::set_default(captured.clone());
+
+        let ip: std::net::IpAddr = "172.30.5.9".parse().expect("test address");
+        log_unresolved_geolocation("172.30.5.9", &GeoIpError::NonGlobalAddress(ip));
+
+        let events = captured.snapshot();
+        assert_eq!(events.len(), 1, "one log line per unresolved address");
+        assert_eq!(events[0].0, Level::DEBUG, "got: {events:?}");
+    }
+
+    /// A public address that simply has no record in the database is normal
+    /// too, and nothing an operator can act on per address.
+    #[test]
+    fn a_global_address_missing_from_the_database_is_logged_below_error() {
+        let captured = CapturedEvents::default();
+        let _guard = tracing::subscriber::set_default(captured.clone());
+
+        log_unresolved_geolocation(
+            "100.128.0.1",
+            &GeoIpError::NotFound("No data found for IP: 100.128.0.1".to_string()),
+        );
+
+        let events = captured.snapshot();
+        assert_eq!(events.len(), 1, "one log line per unresolved address");
+        assert_eq!(events[0].0, Level::DEBUG, "got: {events:?}");
+    }
+
+    /// Anything else is a genuine fault -- an unreadable database, for example
+    /// -- and must stay loud.
+    #[test]
+    fn a_genuine_lookup_failure_is_still_logged_as_an_error() {
+        let captured = CapturedEvents::default();
+        let _guard = tracing::subscriber::set_default(captured.clone());
+
+        log_unresolved_geolocation(
+            "100.128.0.1",
+            &GeoIpError::Other("database unreadable".to_string()),
+        );
+
+        let events = captured.snapshot();
+        assert_eq!(events.len(), 1, "one log line per unresolved address");
+        assert_eq!(events[0].0, Level::ERROR, "got: {events:?}");
+        assert!(
+            events[0].1.contains("Failed to get geolocation data"),
+            "got: {events:?}"
+        );
+    }
+
+    /// End to end against the real database: a private address is still stored
+    /// (callers link events to the row's id) without location data, and no
+    /// ERROR reaches the log.
+    #[tokio::test]
+    async fn a_private_address_is_stored_without_location_data_and_without_an_error() {
+        let Some(path) = crate::geoip_service::bundled_city_db_path() else {
+            println!(
+                "{} is not in this checkout; skipping",
+                crate::CITY_DB_FILENAME
+            );
+            return;
+        };
+        let geoip = Arc::new(GeoIpService::from_city_db_path(&path).expect("open the database"));
+
+        let now = Utc::now();
+        let stored = ip_geolocations::Model {
+            id: 42,
+            ip_address: "172.30.5.9".to_string(),
+            country: String::new(),
+            country_code: None,
+            region: None,
+            city: None,
+            latitude: None,
+            longitude: None,
+            timezone: None,
+            is_eu: false,
+            asn_org: None,
+            is_hosting_provider: None,
+            created_at: now,
+            updated_at: now,
+        };
+        // First query: no existing row. Second: the row the insert returns.
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ip_geolocations::Model>::new(), vec![stored]])
+                .into_connection(),
+        );
+        let service = IpAddressService::new(db, geoip);
+
+        let captured = CapturedEvents::default();
+        let _guard = tracing::subscriber::set_default(captured.clone());
+
+        let info = service
+            .get_or_create_ip("172.30.5.9")
+            .await
+            .expect("a private address must be stored, not rejected");
+
+        assert_eq!(
+            info.id, 42,
+            "the row must be created so events can link to it"
+        );
+        assert_eq!(info.ip, "172.30.5.9");
+        assert_eq!(info.country.as_deref(), Some(""), "no location data");
+        assert_eq!(info.city, None);
+
+        let events = captured.snapshot();
+        assert!(
+            events.iter().all(|(level, _)| *level != Level::ERROR),
+            "a private address must not log an error, got: {events:?}"
         );
     }
 }

@@ -60,6 +60,11 @@ impl From<GeoIpError> for Problem {
             GeoIpError::NotFound(ref message) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("IP Not Found")
                 .with_detail(message.clone()),
+            // Same answer a lookup of a private address always gave: there is no
+            // public location to report for it.
+            GeoIpError::NonGlobalAddress(_) => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("IP Not Found")
+                .with_detail(error.to_string()),
             GeoIpError::Settings(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Geolocation Settings Unavailable")
                 .with_detail(error.to_string()),
@@ -347,6 +352,17 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
         temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+    }
+
+    /// Looking up a private address through `/geo/{ip}` answered 404 before the
+    /// lookup learned to short-circuit them; the API contract must not move.
+    #[test]
+    fn a_non_global_address_is_reported_as_not_found() {
+        let ip: std::net::IpAddr = "172.30.5.9".parse().expect("test address");
+
+        let problem = Problem::from(GeoIpError::NonGlobalAddress(ip));
+
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
     }
 
     /// `/geo/status` sits under the same prefix as the `/geo/{ip}` wildcard.
