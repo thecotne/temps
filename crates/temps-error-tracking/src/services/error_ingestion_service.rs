@@ -329,11 +329,14 @@ impl ErrorIngestionService {
         #[derive(Debug, FromQueryResult)]
         struct SimilarGroup {
             id: i32,
+            // pgvector's `<=>` operator returns `double precision` (FLOAT8), so
+            // this must be `f64`: sqlx refuses to decode FLOAT8 into an `f32`.
             #[allow(dead_code)]
-            distance: f32,
+            distance: f64,
         }
 
-        const SIMILARITY_THRESHOLD: f32 = 0.15; // Cosine distance threshold
+        // Cosine distance threshold, bound as FLOAT8 to match the `<=>` result.
+        const SIMILARITY_THRESHOLD: f64 = 0.15;
 
         // Convert embedding to array string for SQL
         let embedding_array = format!(
