@@ -181,7 +181,6 @@ async fn setup_with_quota(
     let inner = Arc::new(TimescaleDbStorage::with_config(
         Arc::new(mock_db),
         None,
-        7,
         Some(limit_bytes),
         None,
     ));
@@ -947,5 +946,192 @@ async fn test_storage_quota_tracks_real_clickhouse_span_volume() {
     assert_eq!(
         other_quota.total_bytes, 0,
         "an unrelated project must not see this project's ClickHouse-ingested bytes"
+    );
+}
+
+// ── Retention (observability_retention -> per-row retention_days) ─────────
+
+#[derive(::clickhouse::Row, serde::Deserialize)]
+struct RetentionDaysRow {
+    retention_days: u16,
+}
+
+#[derive(::clickhouse::Row, serde::Deserialize)]
+struct CreateTableQueryRow {
+    create_table_query: String,
+}
+
+#[derive(::clickhouse::Row, serde::Deserialize)]
+struct CountRow {
+    count: u64,
+}
+
+async fn retention_days_of(storage: &ClickHouseOtelStorage, sql: &str) -> Vec<u16> {
+    storage
+        .ch_client()
+        .query(sql)
+        .fetch_all::<RetentionDaysRow>()
+        .await
+        .unwrap_or_else(|e| panic!("query `{sql}` failed: {e}"))
+        .into_iter()
+        .map(|row| row.retention_days)
+        .collect()
+}
+
+fn retention_settings(spans: u32, metrics: u32) -> temps_core::ObservabilityRetentionSettings {
+    temps_core::ObservabilityRetentionSettings {
+        otel_spans_days: spans,
+        otel_metrics_days: metrics,
+        ..temps_core::ObservabilityRetentionSettings::default()
+    }
+}
+
+fn retention_gauge(project_id: i32, at: chrono::DateTime<Utc>) -> MetricPoint {
+    let mut point = labelled_gauge(project_id, "GET", 1.0);
+    point.timestamp = at;
+    point
+}
+
+/// The operator's `observability_retention` windows reach ClickHouse: spans,
+/// their trace refs and metric points are stamped with the configured
+/// `retention_days`, the TTL of both tables reads that column, a changed
+/// setting applies to rows written afterwards, and rows already stored keep
+/// the window they were written with.
+#[tokio::test]
+async fn retention_days_follow_observability_retention_settings() {
+    let Some((config, _container)) = start_ch_container().await else {
+        return; // Docker unavailable — skip gracefully.
+    };
+    let mock_db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+    let inner = Arc::new(TimescaleDbStorage::new(Arc::new(mock_db), None));
+    let resolver = Arc::new(temps_core::SettingsRetentionResolver::from_settings(
+        &retention_settings(7, 14),
+    ));
+    let storage = ClickHouseOtelStorage::new(
+        config,
+        inner,
+        resolver.clone() as Arc<dyn temps_core::RetentionResolver>,
+        None,
+    );
+    let project_id = 4_401;
+    let trace_id = format!("{:032x}", 1);
+
+    // ── Rows written under the first settings snapshot ────────────────────
+    storage
+        .store_spans(vec![quota_test_span(project_id, 1)])
+        .await
+        .expect("store span");
+    storage
+        .store_metrics(vec![retention_gauge(
+            project_id,
+            Utc::now() - Duration::minutes(1),
+        )])
+        .await
+        .expect("store metric");
+    storage
+        .record_trace_refs(std::slice::from_ref(&trace_id), project_id)
+        .await
+        .expect("record trace ref");
+
+    assert_eq!(
+        retention_days_of(
+            &storage,
+            "SELECT retention_days FROM spans WHERE project_id = 4401"
+        )
+        .await,
+        vec![7],
+        "spans take otel_spans_days"
+    );
+    assert_eq!(
+        retention_days_of(
+            &storage,
+            "SELECT retention_days FROM metrics WHERE project_id = 4401"
+        )
+        .await,
+        vec![14],
+        "metrics take otel_metrics_days"
+    );
+    assert_eq!(
+        retention_days_of(
+            &storage,
+            "SELECT retention_days FROM cross_project_trace_refs WHERE project_id = 4401"
+        )
+        .await,
+        vec![7],
+        "trace refs expire with the spans they point at"
+    );
+
+    // ── The operator shortens both windows ────────────────────────────────
+    assert!(resolver.apply(&retention_settings(3, 5)));
+    storage
+        .store_spans(vec![quota_test_span(project_id, 2)])
+        .await
+        .expect("store second span");
+    storage
+        .store_metrics(vec![retention_gauge(project_id, Utc::now())])
+        .await
+        .expect("store second metric");
+
+    assert_eq!(
+        retention_days_of(
+            &storage,
+            "SELECT retention_days FROM spans WHERE project_id = 4401 ORDER BY span_id"
+        )
+        .await,
+        vec![7, 3],
+        "new spans take the new window; stored spans keep theirs"
+    );
+    assert_eq!(
+        retention_days_of(
+            &storage,
+            "SELECT retention_days FROM metrics WHERE project_id = 4401 ORDER BY timestamp"
+        )
+        .await,
+        vec![14, 5],
+        "new metrics take the new window; stored metrics keep theirs"
+    );
+
+    // ── Both TTLs read the per-row column ─────────────────────────────────
+    for (table, expected_ttl) in [
+        (
+            "spans",
+            "TTL toDateTime(start_time) + toIntervalDay(retention_days)",
+        ),
+        (
+            "metrics",
+            "TTL toDateTime(timestamp) + toIntervalDay(retention_days)",
+        ),
+    ] {
+        let create = storage
+            .ch_client()
+            .query(
+                "SELECT create_table_query FROM system.tables \
+                 WHERE database = currentDatabase() AND name = ?",
+            )
+            .bind(table)
+            .fetch_one::<CreateTableQueryRow>()
+            .await
+            .unwrap_or_else(|e| panic!("read {table} DDL: {e}"))
+            .create_table_query;
+        assert!(
+            create.contains(expected_ttl),
+            "{table} TTL must read retention_days, got: {create}"
+        );
+    }
+
+    // ── Switching metrics to the per-row TTL queued no table rewrite ──────
+    let metrics_mutations = storage
+        .ch_client()
+        .query(
+            "SELECT count() AS count FROM system.mutations \
+             WHERE database = currentDatabase() AND table = 'metrics'",
+        )
+        .fetch_one::<CountRow>()
+        .await
+        .expect("read system.mutations")
+        .count;
+    assert_eq!(
+        metrics_mutations, 0,
+        "0009 must not queue a MATERIALIZE TTL mutation over existing metric parts"
     );
 }

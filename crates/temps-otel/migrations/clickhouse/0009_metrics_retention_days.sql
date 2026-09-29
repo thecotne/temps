@@ -1,0 +1,49 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
+-- Per-row retention for metrics, the same shape spans got in
+-- 0004_retention_days.sql and 0005_retention_ttl.sql.
+--
+-- WHY
+--
+-- 0003_metrics.sql fixed the TTL at 90 days, so the operator's
+-- observability_retention.otel_metrics_days setting had no effect on
+-- ClickHouse-stored metrics. Ingest now stamps each row with the configured
+-- window (see temps_core::SettingsRetentionResolver) and the TTL reads it.
+--
+-- A per-row column rather than re-running MODIFY TTL with the new number on
+-- every settings change, because:
+--   * it matches spans, proxy_logs and cross_project_trace_refs, so the OTel
+--     and proxy tables are all driven the same way and a per-project
+--     RetentionResolver plugin can cover metrics too.
+--   * a settings change never issues DDL at runtime. A MODIFY TTL with a
+--     different interval queues a MATERIALIZE TTL mutation over every part,
+--     which is exactly the load a small host cannot absorb, and would do so
+--     each time the operator touched the setting.
+--   * the column costs almost nothing on disk: it holds the same value for
+--     long runs of rows, which the default codec compresses to a negligible
+--     size.
+--
+-- EXISTING ROWS
+--
+-- Parts written before this migration have no retention_days data, so reads
+-- (and TTL evaluation during merges) see the DEFAULT, 90 = the interval the
+-- old TTL used. Their expiry therefore does not change. That is also why
+-- materialize_ttl_after_modify is switched off for the MODIFY TTL below: by
+-- default ClickHouse would queue a MATERIALIZE TTL mutation that re-reads the
+-- timestamp column of every existing part only to compute the same
+-- expiry times the parts already record. Parts produced by later merges get
+-- their TTL recomputed from the new expression anyway.
+--
+-- Rows ingested after the upgrade carry the configured window. A shortened
+-- window applies to existing rows only once their original 90 days elapse,
+-- unless the operator rewrites them deliberately, for example
+--   ALTER TABLE metrics UPDATE retention_days = 7 WHERE retention_days > 7
+-- which is a mutation over every matching part and is never run implicitly.
+--
+-- NOTE on comments: this file is processed by execute_multi which strips
+-- whole-line -- comments then splits on semicolons. Do NOT put a semicolon in
+-- any inline after-code comment.
+ALTER TABLE metrics ADD COLUMN IF NOT EXISTS retention_days UInt16 DEFAULT 90;
+
+ALTER TABLE metrics MODIFY TTL toDateTime(timestamp) + toIntervalDay(retention_days) SETTINGS materialize_ttl_after_modify = 0;
