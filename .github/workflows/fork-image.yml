@@ -8,6 +8,10 @@ name: Fork Image
 # run its own patches on top of upstream `main` without waiting for an
 # upstream release.
 #
+# Local builds are the default: run scripts/fork/build-image.sh on the build
+# machine (low-priority cargo, no registry push). This workflow is a manual
+# fallback that only runs on workflow_dispatch; it no longer triggers on push.
+#
 # Every job is guarded by `github.repository == 'thecotne/temps'`, so this
 # workflow is inert if it is ever merged upstream or copied to another fork.
 #
@@ -29,9 +33,6 @@ name: Fork Image
 # Bun and Docker layer caches stay restore-only, as in release.yml.
 
 on:
-  push:
-    branches:
-      - production
   workflow_dispatch:
     inputs:
       tag_suffix:
